@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32-S3-Touch-LCD-1.85B · 圆屏 UI 设计原型</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --card:#ffffff; --ink:#1b2430; --ink2:#5b6878; --ink3:#8b98a8;
+    --line:#e3e8ee; --accent:#e2622e; --accent2:#2f7d6b; --mono:ui-monospace,Consolas,"Courier New",monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+  header{padding:22px 32px 16px;border-bottom:1px solid var(--line);background:#fff}
+  h1{margin:0;font-size:19px;letter-spacing:-.2px}
+  header p{margin:6px 0 0;font-size:12.5px;color:var(--ink2)}
+  .chips{display:flex;gap:7px;flex-wrap:wrap;margin-top:11px}
+  .chip{font:11px/1 var(--mono);padding:6px 9px;border:1px solid var(--line);border-radius:5px;background:#fafbfc;color:var(--ink2)}
+  .chip b{color:var(--ink);font-weight:600}
+  .wrap{display:flex;gap:36px;align-items:flex-start;justify-content:center;padding:30px 32px 44px;flex-wrap:wrap}
+  .left{display:flex;flex-direction:column;align-items:center;gap:20px}
+  /* ---- device ---- */
+  .device{width:434px;height:434px;border-radius:50%;background:
+      radial-gradient(circle at 34% 26%,#c9ced4 0%,#8d959e 34%,#5c646d 68%,#3c434b 100%);
+    padding:37px;box-shadow:0 22px 48px rgba(20,30,45,.26),inset 0 2px 3px rgba(255,255,255,.55),inset 0 -3px 8px rgba(0,0,0,.3);position:relative}
+  .device::after{content:"";position:absolute;inset:12px;border-radius:50%;border:1px solid rgba(255,255,255,.13);pointer-events:none}
+  .glass{width:360px;height:360px;border-radius:50%;overflow:hidden;position:relative;background:#0b1014;
+    box-shadow:inset 0 0 0 2px #10161c,inset 0 0 30px rgba(0,0,0,.7),0 0 0 3px #252b32}
+  .screen{position:absolute;inset:0;opacity:0;pointer-events:none;transition:opacity .32s ease,transform .32s ease;transform:scale(.965)}
+  .screen.active{opacity:1;pointer-events:auto;transform:scale(1)}
+  .screen svg{display:block;width:360px;height:360px}
+  .tap{cursor:pointer}
+  /* safety overlay */
+  #safety{position:absolute;inset:0;pointer-events:none;display:none}
+  #safety.on{display:block}
+  /* ---- tabs ---- */
+  .tabs{display:flex;gap:6px;background:#fff;padding:6px;border:1px solid var(--line);border-radius:11px;box-shadow:0 4px 14px rgba(20,30,45,.05)}
+  .tab{border:0;background:transparent;padding:9px 15px;border-radius:7px;font-size:12.5px;color:var(--ink2);cursor:pointer;font-family:inherit;white-space:nowrap;transition:.16s}
+  .tab:hover{background:#f2f4f7;color:var(--ink)}
+  .tab.active{background:var(--ink);color:#fff}
+  .toolbar{display:flex;gap:14px;align-items:center;font-size:12px;color:var(--ink2)}
+  .toolbar label{display:flex;gap:6px;align-items:center;cursor:pointer;user-select:none}
+  .toolbar input{accent-color:var(--accent)}
+  /* ---- right panel ---- */
+  .right{width:392px;max-width:100%}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px 22px;box-shadow:0 4px 16px rgba(20,30,45,.04)}
+  .panel .eyebrow{font:11px/1 var(--mono);color:var(--accent);letter-spacing:1.2px;text-transform:uppercase}
+  .panel h2{margin:10px 0 6px;font-size:18px}
+  .panel .sub{font-size:12.5px;color:var(--ink2);line-height:1.7;margin:0 0 16px}
+  .kv{border-top:1px solid var(--line)}
+  .row{display:flex;gap:12px;padding:10px 0;border-bottom:1px solid var(--line);font-size:12.5px;line-height:1.65}
+  .row .k{flex:0 0 76px;color:var(--ink3);font:11px/1.65 var(--mono);padding-top:2px}
+  .row .v{color:var(--ink2)}
+  .row .v b{color:var(--ink);font-weight:600}
+  .note{margin-top:16px;padding:12px 14px;background:#fff7f2;border-left:3px solid var(--accent);border-radius:0 6px 6px 0;font-size:12px;line-height:1.7;color:#7a4a30}
+  .note b{color:#5d341d}
+  .facts{margin-top:14px}
+  .facts .panel{padding:16px 20px}
+  .facts h3{margin:0 0 10px;font-size:13px}
+  .facts ul{margin:0;padding-left:17px;font-size:12px;line-height:1.9;color:var(--ink2)}
+  .facts code{font:11px var(--mono);background:#f1f3f6;padding:1px 4px;border-radius:3px;color:#3b4a5c}
+  footer{padding:0 32px 34px;text-align:center;font-size:11.5px;color:var(--ink3);line-height:1.8}
+  /* ---- svg helpers ---- */
+  .lbl{font-family:var(--mono);fill:#8b98a8}
+  .hand{transition:transform .28s cubic-bezier(.4,0,.2,1)}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @keyframes sweep{to{transform:rotate(360deg)}}
+  #sweep{transform-origin:180px 180px;animation:sweep 5s linear infinite}
+  #vinyl{transform-origin:180px 180px;animation:spin 9s linear infinite}
+  #vinyl.paused{animation-play-state:paused}
+  .eqbar{animation:eq 1.05s ease-in-out infinite alternate}
+  @keyframes eq{from{transform:scaleY(.28)}to{transform:scaleY(1)}}
+  @media(max-width:900px){.wrap{padding:22px 14px 34px}.device{transform:scale(.82);margin:-30px 0}.right{width:100%;max-width:434px}}
+</style>
+</head>
+<body>
+<!-- 天气图标库：symbol 放全局，两套表盘的 <use> 共享。太阳固定橙，云取 currentColor -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="ic-clear" viewBox="0 0 40 40">
+      <g stroke="#f0b429" stroke-width="2.2" stroke-linecap="round"><path d="M20 3 V8 M20 32 V37 M3 20 H8 M32 20 H37 M8 8 L11.5 11.5 M28.5 28.5 L32 32 M32 8 L28.5 11.5 M11.5 28.5 L8 32"/></g>
+      <circle cx="20" cy="20" r="8" fill="#f0b429"/>
+    </symbol>
+    <symbol id="ic-partly" viewBox="0 0 40 40">
+      <g stroke="#f0b429" stroke-width="1.8" stroke-linecap="round"><path d="M13 2 V6 M3 12 H7 M5.5 5.5 L8 8 M23 5 L21 8"/></g>
+      <circle cx="14" cy="13" r="6" fill="#f0b429"/>
+      <g fill="currentColor"><circle cx="16" cy="25" r="6.5"/><circle cx="26" cy="23" r="8"/><rect x="9" y="25" width="23" height="7" rx="3.5"/></g>
+    </symbol>
+    <symbol id="ic-cloud" viewBox="0 0 40 40">
+      <g fill="currentColor"><circle cx="15" cy="19" r="7.5"/><circle cx="25" cy="17" r="9.5"/><rect x="7" y="19" width="26" height="8" rx="4"/></g>
+    </symbol>
+    <symbol id="ic-fog" viewBox="0 0 40 40">
+      <g fill="currentColor"><circle cx="15" cy="17" r="7"/><circle cx="25" cy="15" r="9"/><rect x="7" y="17" width="26" height="7" rx="3.5"/></g>
+      <g stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity=".75"><path d="M7 29 H33 M11 34 H29"/></g>
+    </symbol>
+    <symbol id="ic-rain" viewBox="0 0 40 40">
+      <g fill="currentColor"><circle cx="15" cy="17" r="7"/><circle cx="25" cy="15" r="9"/><rect x="7" y="17" width="26" height="7" rx="3.5"/></g>
+      <g stroke="#58a8e0" stroke-width="2.4" stroke-linecap="round"><path d="M12 28 L10 35 M20 28 L18 35 M28 28 L26 35"/></g>
+    </symbol>
+    <symbol id="ic-snow" viewBox="0 0 40 40">
+      <g fill="currentColor"><circle cx="15" cy="17" r="7"/><circle cx="25" cy="15" r="9"/><rect x="7" y="17" width="26" height="7" rx="3.5"/></g>
+      <g fill="#9fd4f5"><circle cx="11" cy="33" r="2"/><circle cx="20" cy="34" r="2"/><circle cx="29" cy="33" r="2"/></g>
+    </symbol>
+    <symbol id="ic-storm" viewBox="0 0 40 40">
+      <g fill="currentColor"><circle cx="15" cy="16" r="7"/><circle cx="25" cy="14" r="9"/><rect x="7" y="16" width="26" height="7" rx="3.5"/></g>
+      <path d="M22 24 L15 34 H19 L17 39 L27 29 H22 L25 24 Z" fill="#f0b429"/>
+    </symbol>
+  </defs>
+</svg>
+<header>
+  <h1>圆形桌面时钟（天气） / 播放器 / 航班雷达 / 番茄钟 — UI 设计原型</h1>
+  <p>Waveshare ESP32-S3-Touch-LCD-1.85B · 1.85" 圆形 QSPI LCD，360×360，ST77916 + CST816S 电容触摸 · <b>演示优先</b></p>
+  <div class="chips">
+    <span class="chip"><b>360×360</b> 圆屏</span>
+    <span class="chip">安全半径 <b>r≈158</b></span>
+    <span class="chip">RGB565 / <b>262K</b> 面板</span>
+    <span class="chip"><b>8MB</b> PSRAM · <b>16MB</b> Flash</span>
+    <span class="chip">ES8311 + <b>PCF85063 RTC</b></span>
+    <span class="chip">CST816S <b>单点 + 手势</b></span>
+    <span class="chip">雷达参考 <b>delphicchen/esp32_flight_radar</b></span>
+    <span class="chip">天气 <b>彩云 v2.6</b> · 30 min</span>
+    <span class="chip">航班 <b>adsb.lol</b> · 60 s · 250 km</span>
+    <span class="chip"><b>演示兜底</b> · 屏幕常有飞机</span>
+    <span class="chip">最小字号 <b>12 px</b>（表盘）</span>
+    <span class="chip">固件 <b>已编译 + 已烧录 COM12</b></span>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="left">
+    <div class="device">
+      <div class="glass" id="glass">
+
+        <!-- ============ 1. 机械表盘 ============ -->
+        <div class="screen active" data-page="0">
+          <svg viewBox="0 0 360 360" id="svg-analog">
+            <defs>
+              <radialGradient id="bgA" cx="42%" cy="34%"><stop offset="0" stop-color="#1d2830"/><stop offset="62%" stop-color="#111a21"/><stop offset="100%" stop-color="#070b0e"/></radialGradient>
+              <linearGradient id="metal" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#e7ded0"/><stop offset="50%" stop-color="#a99c88"/><stop offset="100%" stop-color="#d8cdb9"/></linearGradient>
+              <linearGradient id="handG" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff6e8"/><stop offset="100%" stop-color="#bfae94"/></linearGradient>
+            </defs>
+            <circle cx="180" cy="180" r="180" fill="url(#bgA)"/>
+            <circle cx="180" cy="180" r="172" fill="none" stroke="#2b353d" stroke-width="1"/>
+            <circle cx="180" cy="180" r="163" fill="none" stroke="#3b4650" stroke-width="2"/>
+            <circle cx="180" cy="180" r="158" fill="none" stroke="#232c34" stroke-width="1"/>
+            <g id="ticks"></g>
+            <g id="numerals"></g>
+            <text x="180" y="112" text-anchor="middle" fill="#cbbda2" font-size="14" letter-spacing="4.2" font-family="Georgia,serif">A E R O</text>
+            <!-- 天气副盘改画在指针上层，见下方：否则 25 分前后分针会压住温度 -->
+            <!-- 3点位：日期窗 -->
+            <rect x="241" y="165" width="38" height="30" rx="4" fill="#f0ece2" stroke="#8d8270" stroke-width="1"/>
+            <text id="dateWin" x="260" y="188" text-anchor="middle" fill="#20262b" font-size="21" font-family="monospace">14</text>
+            <!-- hands -->
+            <g id="hHour" class="hand"><path d="M180 180 L175.5 174 L177 104 L180 96 L183 104 L184.5 174 Z" fill="url(#handG)" stroke="#5b5142" stroke-width=".6"/><path d="M180 108 L180 168" stroke="#2a3036" stroke-width="1.2"/></g>
+            <g id="hMin" class="hand"><path d="M180 180 L176.8 174 L178.2 84 L180 72 L181.8 84 L183.2 174 Z" fill="url(#handG)" stroke="#5b5142" stroke-width=".6"/><path d="M180 86 L180 166" stroke="#2a3036" stroke-width="1.1"/></g>
+            <g id="hSec" class="hand"><path d="M180 196 L179.3 180 L179.6 62 L180.4 62 L180.7 180 L180 196 Z" fill="#e2622e"/><circle cx="180" cy="76" r="3.2" fill="none" stroke="#e2622e" stroke-width="1.2"/></g>
+            <circle cx="180" cy="180" r="6.5" fill="#d9cbb2" stroke="#4a4236" stroke-width="1"/>
+            <circle cx="180" cy="180" r="2" fill="#2a3036"/>
+            <!-- 6点位：天气副盘置于指针上层，温度永远不被扫过的指针遮挡 -->
+            <g id="wxAnalog" class="tap">
+              <circle cx="180" cy="252" r="42" fill="#0d151b" stroke="#4a5560" stroke-width="1.5"/>
+              <circle cx="180" cy="252" r="36" fill="none" stroke="#2b353d" stroke-width="1" stroke-dasharray="1 4"/>
+              <use id="wxIconA" href="#ic-cloud" x="165" y="213" width="30" height="30" style="color:#cfc2a8"/>
+              <text id="wxTempA" x="180" y="267" text-anchor="middle" fill="#f2e6cf" font-size="26" font-family="monospace">16°</text>
+              <text id="wxDescA" x="180" y="285" text-anchor="middle" fill="#a8b4bb" font-size="13" font-family="sans-serif">阴</text>
+            </g>
+          </svg>
+        </div>
+
+        <!-- ============ 2. 电子表盘 ============ -->
+        <div class="screen" data-page="1">
+          <svg viewBox="0 0 360 360">
+            <defs>
+              <linearGradient id="bgD" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fbf9f3"/><stop offset="100%" stop-color="#eae7dd"/></linearGradient>
+            </defs>
+            <circle cx="180" cy="180" r="180" fill="url(#bgD)"/>
+            <circle cx="180" cy="180" r="158" fill="none" stroke="#d8d4c8" stroke-width="1"/>
+            <!-- second progress ring -->
+            <circle cx="180" cy="180" r="150" fill="none" stroke="#ded9cc" stroke-width="5"/>
+            <circle id="secRing" cx="180" cy="180" r="150" fill="none" stroke="#e2622e" stroke-width="5" stroke-linecap="round"
+                    stroke-dasharray="0 942" transform="rotate(-90 180 180)"/>
+            <text x="180" y="70" text-anchor="middle" fill="#8d887a" font-size="14" letter-spacing="2.6" font-family="monospace">SATURDAY</text>
+            <text x="180" y="92" text-anchor="middle" fill="#8d887a" font-size="13" letter-spacing="1.6" font-family="monospace">2026 · 11 · 14</text>
+            <text id="digTime" x="180" y="176" text-anchor="middle" fill="#20262b" font-size="68" font-weight="300"
+                  letter-spacing="-2" font-family="ui-monospace,Consolas,monospace">10:28</text>
+            <text id="digSec" x="180" y="204" text-anchor="middle" fill="#e2622e" font-size="18" letter-spacing="5" font-family="monospace">:42</text>
+            <line x1="112" y1="220" x2="248" y2="220" stroke="#d3cec0" stroke-width="1"/>
+            <!-- 天气主区：大图标 + 32px 温度 + 16px 状况 + 12px 高低温，点击切换 WMO 码 -->
+            <g id="wxDigital" class="tap">
+              <use id="wxIconD" href="#ic-cloud" x="96" y="238" width="42" height="42" style="color:#6b7b86"/>
+              <text id="wxTempD" x="146" y="270" fill="#20262b" font-size="32" font-family="monospace"
+                    style="paint-order:stroke;stroke:#f4f1e9;stroke-width:4px;stroke-linejoin:round">16°</text>
+              <text id="wxDescD" x="216" y="256" fill="#3a4a44" font-size="16" font-family="sans-serif"
+                    style="paint-order:stroke;stroke:#f4f1e9;stroke-width:4px;stroke-linejoin:round">阴</text>
+              <text id="wxRangeD" x="216" y="278" fill="#8d887a" font-size="12" font-family="monospace"
+                    style="paint-order:stroke;stroke:#f4f1e9;stroke-width:4px;stroke-linejoin:round">15/19°</text>
+            </g>
+            <text x="180" y="306" text-anchor="middle" fill="#8d887a" font-size="12" letter-spacing=".8" font-family="monospace"
+                  style="paint-order:stroke;stroke:#f4f1e9;stroke-width:4px;stroke-linejoin:round">86% · WI-FI · RTC</text>
+            <g fill="#c9c5b8"><circle cx="166" cy="318" r="3.2"/><circle cx="180" cy="318" r="3.2" fill="#e2622e"/><circle cx="194" cy="318" r="3.2"/></g>
+          </svg>
+        </div>
+
+        <!-- ============ 3. 音乐播放（极简 · 突出控制键 · 整屏黑胶转动） ============ -->
+        <div class="screen" data-page="2">
+          <svg viewBox="0 0 360 360">
+            <defs>
+              <radialGradient id="bgM" cx="50%" cy="38%"><stop offset="0" stop-color="#232b3c"/><stop offset="70%" stop-color="#131a27"/><stop offset="100%" stop-color="#0a0e17"/></radialGradient>
+            </defs>
+            <circle cx="180" cy="180" r="180" fill="url(#bgM)"/>
+            <!-- 黑胶铺满整屏：同心沟槽 + 随组旋转的高光扇区，转动肉眼可辨 -->
+            <g id="vinyl">
+              <circle cx="180" cy="180" r="176" fill="#10141b"/>
+              <g fill="none" stroke="#262c36" stroke-width="1">
+                <circle cx="180" cy="180" r="168"/><circle cx="180" cy="180" r="161"/>
+                <circle cx="180" cy="180" r="154"/><circle cx="180" cy="180" r="147"/>
+                <circle cx="180" cy="180" r="140"/><circle cx="180" cy="180" r="133"/>
+                <circle cx="180" cy="180" r="126"/><circle cx="180" cy="180" r="119"/>
+                <circle cx="180" cy="180" r="112"/><circle cx="180" cy="180" r="105"/>
+                <circle cx="180" cy="180" r="98"/><circle cx="180" cy="180" r="91"/>
+                <circle cx="180" cy="180" r="84"/><circle cx="180" cy="180" r="77"/>
+                <circle cx="180" cy="180" r="70"/>
+              </g>
+              <g fill="#1e2634" opacity=".85">
+                <path d="M180 180 L180 12 A168 168 0 0 1 296 62 Z"/>
+                <path d="M180 180 L296 62 A168 168 0 0 1 331 249 Z" opacity=".35"/>
+                <path d="M180 180 L64 296 A168 168 0 0 1 12 92 Z" opacity=".5"/>
+              </g>
+            </g>
+            <!-- 外圈进度弧（固定层，不随唱片转） -->
+            <circle cx="180" cy="180" r="170" fill="none" stroke="#2c3548" stroke-width="3"/>
+            <circle id="playArc" cx="180" cy="180" r="170" fill="none" stroke="#e2622e" stroke-width="3"
+                    stroke-linecap="round" stroke-dasharray="0 1068" transform="rotate(90 180 180)"/>
+            <!-- 极简文字：只有来源状态 + 曲名 -->
+            <text id="mSrc" x="180" y="46" text-anchor="middle" fill="#9fb0c8" font-size="12" letter-spacing="1.2" font-family="monospace">RADIO · PLAYING</text>
+            <text id="mStation" x="180" y="70" text-anchor="middle" fill="#eef2f8" font-size="15" letter-spacing=".5" font-family="monospace">CITY FM 101.7</text>
+            <!-- 中央超大播放键：全页视觉焦点 -->
+            <g id="btnPlay" class="tap">
+              <circle cx="180" cy="180" r="62" fill="#14161c" stroke="#3a4560" stroke-width="2"/>
+              <circle cx="180" cy="180" r="48" fill="#e2622e"/>
+              <g id="icoPause"><rect x="166" y="162" width="9" height="36" rx="2" fill="#fff"/><rect x="185" y="162" width="9" height="36" rx="2" fill="#fff"/></g>
+              <path id="icoPlay" d="M170 158 L204 180 L170 202 Z" fill="#fff" style="display:none"/>
+            </g>
+            <!-- 左右切曲（次一级，但手指也好点） -->
+            <g id="btnPrev" class="tap"><circle cx="82" cy="180" r="28" fill="#222b3b" stroke="#3a4560" stroke-width="1"/><path d="M90 170 L74 180 L90 190 Z" fill="#cdd7e6"/><rect x="72" y="170" width="3" height="20" fill="#cdd7e6"/></g>
+            <g id="btnNext" class="tap"><circle cx="278" cy="180" r="28" fill="#222b3b" stroke="#3a4560" stroke-width="1"/><path d="M270 170 L286 180 L270 190 Z" fill="#cdd7e6"/><rect x="285" y="170" width="3" height="20" fill="#cdd7e6"/></g>
+            <text x="180" y="268" text-anchor="middle" fill="#6d7c94" font-size="11" letter-spacing="1.2" font-family="monospace">DISC PLAY  /  SIDES SWITCH</text>
+            <g fill="#3a4560"><circle cx="152" cy="292" r="3"/><circle cx="166" cy="292" r="3"/><circle cx="180" cy="292" r="3" fill="#e2622e"/><circle cx="194" cy="292" r="3"/><circle cx="208" cy="292" r="3"/></g>
+          </svg>
+        </div>
+
+        <!-- ============ 4. 航班雷达 ============ -->
+        <div class="screen" data-page="3">
+          <svg viewBox="0 0 360 360" id="svg-radar">
+            <defs>
+              <radialGradient id="bgR"><stop offset="0" stop-color="#0d1c18"/><stop offset="100%" stop-color="#050c0a"/></radialGradient>
+              <linearGradient id="sweepG" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#4ade80" stop-opacity="0"/><stop offset="100%" stop-color="#4ade80" stop-opacity=".22"/></linearGradient>
+            </defs>
+            <circle cx="180" cy="180" r="180" fill="url(#bgR)"/>
+            <clipPath id="clipR"><circle cx="180" cy="180" r="158"/></clipPath>
+            <g clip-path="url(#clipR)">
+              <g id="sweep"><path d="M180 180 L180 22 A158 158 0 0 1 318 100 Z" fill="url(#sweepG)"/><path d="M180 180 L180 68" stroke="#4ade80" stroke-width="1" opacity=".55"/></g>
+            </g>
+            <g fill="none" stroke="#20503c" stroke-width="1">
+              <circle cx="180" cy="180" r="52"/><circle cx="180" cy="180" r="104"/><circle cx="180" cy="180" r="156"/>
+            </g>
+            <g stroke="#1d4636" stroke-width="1"><path d="M180 60 L180 300 M24 180 L336 180"/></g>
+            <g id="bearings"></g>
+            <circle cx="180" cy="180" r="158" fill="none" stroke="#2b6b4e" stroke-width="1.5"/>
+            <g id="planes"></g>
+            <!-- own position -->
+            <rect x="175" y="175" width="10" height="10" rx="2" fill="#e9fff2" stroke="#4ade80" stroke-width="1.2"/>
+            <circle cx="180" cy="180" r="14" fill="none" stroke="#4ade80" stroke-width="1" opacity=".5"/>
+            <!-- header -->
+            <text x="180" y="36" text-anchor="middle" fill="#7fe6ab" font-size="12" letter-spacing="2" font-family="monospace" style="paint-order:stroke;stroke:#06100e;stroke-width:3px;stroke-linejoin:round">FLIGHT RADAR</text>
+            <text id="radarSrc" class="tap" x="180" y="54" text-anchor="middle" fill="#3f8a68" font-size="10" letter-spacing=".8" font-family="monospace" style="paint-order:stroke;stroke:#06100e;stroke-width:3px;stroke-linejoin:round">ADSB.LOL / 60s / 463 KM</text>
+            <!-- range selector：内移到圆内，避免右下角被外壳裁掉 -->
+            <g id="rangeSel" class="tap">
+              <rect x="228" y="64" width="62" height="23" rx="11.5" fill="#102a20" stroke="#2b6b4e"/>
+              <text x="259" y="80" text-anchor="middle" fill="#7fe6ab" font-size="11" font-family="monospace">250 nm ▾</text>
+            </g>
+            <!-- detail card：整块居中，四角不越 r=158 -->
+            <g id="detail" style="display:none">
+              <rect x="82" y="226" width="196" height="74" rx="9" fill="#0a1c15" stroke="#2b6b4e" stroke-width="1"/>
+              <text id="dCall" x="94" y="248" fill="#c6ffe0" font-size="16" font-family="monospace">CSZ9917</text>
+              <text id="dSub" x="94" y="265" fill="#5fae86" font-size="10.5" font-family="monospace">FL 311 · 1018 km/h · 35°</text>
+              <text id="dPos" x="94" y="281" fill="#5fae86" font-size="10.5" font-family="monospace">62 km · 038° · descending</text>
+              <text id="dType" x="94" y="295" fill="#3f8a68" font-size="10.5" font-family="monospace">A320 · B-30A6</text>
+              <text x="266" y="248" text-anchor="end" fill="#3f8a68" font-size="10" font-family="monospace">ADS-B</text>
+            </g>
+          </svg>
+        </div>
+
+        <!-- ============ 5. 番茄钟 ============ -->
+        <div class="screen" data-page="4">
+          <svg viewBox="0 0 360 360" id="svg-pomo">
+            <circle cx="180" cy="180" r="180" fill="#12151b"/>
+            <circle cx="180" cy="180" r="168" fill="#181c24"/>
+            <circle cx="180" cy="180" r="158" fill="none" stroke="#323a48" stroke-width="1"/>
+            <circle cx="180" cy="180" r="148" fill="none" stroke="#303744" stroke-width="6"/>
+            <circle id="pomoArc" cx="180" cy="180" r="148" fill="none" stroke="#e2622e" stroke-width="6"
+                    stroke-linecap="round" stroke-dasharray="0 930" transform="rotate(-90 180 180)"/>
+            <text x="180" y="54" text-anchor="middle" fill="#96a2b6" font-size="12" letter-spacing="2.4" font-family="monospace">POMODORO</text>
+            <text id="pomoState" x="180" y="82" text-anchor="middle" fill="#e2622e" font-size="17" font-family="sans-serif">专注中</text>
+            <text id="pomoTime" x="180" y="168" text-anchor="middle" fill="#f2f5fa" font-size="68" font-weight="300"
+                  letter-spacing="-1" font-family="ui-monospace,Consolas,monospace">25:00</text>
+            <text id="pomoRun" x="180" y="196" text-anchor="middle" fill="#8b97a9" font-size="12" letter-spacing="2" font-family="monospace">READY</text>
+            <g id="pomoDots" fill="#46506a">
+              <circle cx="153" cy="220" r="4"/><circle cx="171" cy="220" r="4"/>
+              <circle cx="189" cy="220" r="4"/><circle cx="207" cy="220" r="4"/>
+            </g>
+            <g id="pomoReset" class="tap"><circle cx="104" cy="272" r="23" fill="#28303e" stroke="#46506a" stroke-width="1"/><text x="104" y="280" text-anchor="middle" fill="#cdd7e6" font-size="20" font-family="monospace">R</text></g>
+            <g id="pomoMain" class="tap"><circle cx="180" cy="272" r="32" fill="#e2622e"/><path id="pomoIcoPlay" d="M172 258 L172 286 L198 272 Z" fill="#fff"/><g id="pomoIcoPause" style="display:none"><rect x="169" y="259" width="8" height="26" rx="2" fill="#fff"/><rect x="184" y="259" width="8" height="26" rx="2" fill="#fff"/></g></g>
+            <g id="pomoSkip" class="tap"><circle cx="256" cy="272" r="23" fill="#28303e" stroke="#46506a" stroke-width="1"/><text x="256" y="280" text-anchor="middle" fill="#cdd7e6" font-size="20" font-family="monospace">&gt;</text></g>
+            <text x="180" y="316" text-anchor="middle" fill="#6d7c94" font-size="11" letter-spacing="1.4" font-family="monospace">START / RESET / SKIP</text>
+            <g fill="#46506a"><circle cx="152" cy="336" r="3"/><circle cx="166" cy="336" r="3"/><circle cx="180" cy="336" r="3"/><circle cx="194" cy="336" r="3"/><circle cx="208" cy="336" r="3" fill="#e2622e"/></g>
+          </svg>
+        </div>
+
+        <svg id="safety" viewBox="0 0 360 360">
+          <circle cx="180" cy="180" r="158" fill="none" stroke="#4ade80" stroke-width="1.5" stroke-dasharray="5 4"/>
+          <circle cx="180" cy="180" r="180" fill="none" stroke="#f87171" stroke-width="1.5" stroke-dasharray="5 4"/>
+          <text x="180" y="20" text-anchor="middle" fill="#f87171" font-size="11" font-family="monospace">r=180 物理边缘</text>
+          <text x="180" y="347" text-anchor="middle" fill="#4ade80" font-size="11" font-family="monospace">r=158 安全区 / 外壳遮挡带 22px</text>
+        </svg>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" data-go="0">① 机械表盘</button>
+      <button class="tab" data-go="1">② 电子表盘</button>
+      <button class="tab" data-go="2">③ 音乐播放</button>
+      <button class="tab" data-go="3">④ 航班雷达</button>
+      <button class="tab" data-go="4">⑤ 番茄钟</button>
+    </div>
+    <div class="toolbar">
+      <label><input type="checkbox" id="safeChk"> 显示圆屏安全区</label>
+      <span>· 左右滑动 / ← → 切页 · 点天气区循环天气 · 点按键可交互</span>
+    </div>
+  </div>
+
+  <div class="right">
+    <div class="panel">
+      <div class="eyebrow" id="pEyebrow">01 / WATCH FACE</div>
+      <h2 id="pTitle">机械表盘</h2>
+      <p class="sub" id="pSub">极坐标布局，静态刻度烧进 Flash 位图，只旋转 3 个指针精灵。</p>
+      <div class="kv" id="pRows"></div>
+      <div class="note" id="pNote"></div>
+    </div>
+    <div class="facts panel">
+      <h3>硬件约束（决定 UI 形态）</h3>
+      <ul>
+        <li>圆形有效区 <code>r=180</code>，CNC 外壳再吃掉约 22px → 交互元素一律压进 <code>r≤158</code>。</li>
+        <li>四角是死区；所有排版走极坐标，不用矩形卡片思维。</li>
+        <li>CST816S 只有<b>单点 + 上下左右手势</b>，没有双指缩放 → 雷达缩放必须做成档位按钮 / 上下滑。</li>
+        <li>触摸、IMU、RTC、Codec、电量计共用 <code>GPIO10/11</code> 一条 I²C，驱动层必须加 mutex。</li>
+        <li>PCF85063 带 INT(GPIO6)：断网照常走时，整点报时 / 熄屏唤醒都靠它。</li>
+        <li>RGB565 实际 65K 色：大面积平滑渐变会出色带，表盘用分层色块而非渐变。</li>
+      </ul>
+    </div>
+    <div class="facts panel" style="margin-top:12px">
+      <h3>字号规范 · 1.85" 圆屏物理换算</h3>
+      <ul>
+        <li>屏直径 <code>47 mm / 360 px</code> → <code>1 px ≈ 0.13 mm</code>；大写字母实际高约 <code>0.72 em</code>。</li>
+        <li><b>12 px</b> ≈ 1.1 mm 是静态标签下限；<b>16 px</b> ≈ 1.5 mm 给次要信息；<b>24–32 px</b> ≈ 2.2–3.0 mm 才适合关键数值。</li>
+        <li>原来的 <b>6.5 / 7 / 8 px</b> 字实际只有 0.6–0.8 mm，50 cm 视距根本看不清 —— 本版全部删除或放大到 ≥10 px。</li>
+        <li>机械表盘：罗马数字 17–20 px、日期 21 px、温度 26 px；电子表盘：时间 68 px、温度 32 px、标签 ≥12 px。</li>
+        <li><b>字大必然挤掉信息</b>：机械表盘砍掉品牌副标和底部小字，电子表盘砍掉两个带 6.5 px 标签的副环，位置让给天气。</li>
+      </ul>
+    </div>
+    <div class="facts panel" style="margin-top:12px">
+      <h3>数据源实测 · 2026-11-14</h3>
+      <ul>
+        <li><b>彩云天气 v2.6</b>：国内域名可达、TLS <code>1.56 s</code>；官方 demo token 实测 <code>429 API quota is exhausted</code> → <b>必须填自己的 token</b></li>
+        <li>彩云取 <code>result.realtime.temperature / skycon</code> 与 <code>result.daily.temperature[0].max/min</code>；<code>CLOUDY</code>/<code>PARTLY_CLOUDY_NIGHT</code> 等 skycon 本地映射 7 组图标</li>
+        <li><b>adsb.lol</b> 200 / 免密钥：上海 250 nm 26 架、北京 100 nm 41 架、法兰克福 250 nm 542 架（332 KB）</li>
+        <li><b>OpenSky</b> 200，匿名 400 credits/日、认证 4000/日；<code>states</code> 是二维数组，按索引 0–17 解析</li>
+        <li><b>airplanes.live</b> 403「请联系我们」→ 已不能当免费兜底</li>
+        <li><b>蜻蜓 FM MP3 直链</b> <code>lhttp.qtfm.cn/live/…/64k.mp3</code> → 200 / audio/mpeg，国内最稳</li>
+        <li><b>播客 RSS</b>：NPR feed 达 <code>2 MB</code>、enclosure <code>4 次重定向</code>；最终 CDN 支持 Range（206）→ RSS 必须在配置端解析</li>
+        <li><b>Open-Meteo</b> 674 B / 免密钥 / 10 000 次每日，作为彩云的离线旁证；<b>weather.com.cn</b> 已 301、<b>wttr.in</b> 超时，均剔除</li>
+      </ul>
+    </div>
+    <div class="facts panel" style="margin-top:12px">
+      <h3>演示优先策略（本版新增）</h3>
+      <ul>
+        <li><b>天气</b>：刷新降到 <b>30 min</b>；无 token / 断网时用内置 7 组演示天气，点天气区可循环查看</li>
+        <li><b>航班</b>：刷新降到 <b>60 s</b>；默认 <b>250 km</b>；实时不足 5 架用演示目标补足，屏幕永不空</li>
+        <li><b>离线可跑</b>：五页全部不依赖网络；上电立刻满屏飞机 + 演示天气，联网成功后再静默替换</li>
+        <li><b>固件状态</b>：Arduino 3.0.7 / IDF 5.1 编译通过（<code>1.12 MB / 35% app</code>），已烧录 <code>COM12</code>；QSPI、ST77916、CST816S、PSRAM 帧缓冲启动日志全部正常</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<footer>
+  交互原型（浏览器模拟，非固件）· 屏幕内容按 360×360 / 1:1 像素绘制 · 数据源与架构详见 DESIGN.md<br>
+  ESP32-S3-Touch-LCD-1.85B 设计稿 v0.4 · 彩云天气 + 降刷新 + 大半径雷达 + 极简音乐页 + 番茄钟<br>
+  固件已编译烧录到 COM12，五页实机截图见 firmware/preview/，用法见 firmware/README.md
+</footer>
+
+<script>
+(function(){
+  "use strict";
+  var SVGNS="http://www.w3.org/2000/svg";
+  function el(tag,attrs,parent){var n=document.createElementNS(SVGNS,tag);for(var k in attrs)n.setAttribute(k,attrs[k]);if(parent)parent.appendChild(n);return n;}
+  function pol(cx,cy,r,deg){var a=(deg-90)*Math.PI/180;return [cx+r*Math.cos(a),cy+r*Math.sin(a)];}
+
+  /* ---------- 机械表盘：刻度 + 数字 ---------- */
+  var ticks=document.getElementById("ticks"),nums=document.getElementById("numerals");
+  for(var i=0;i<60;i++){
+    var major=i%5===0, p1=pol(180,180,major?140:150,i*6), p2=pol(180,180,157,i*6);
+    el("line",{x1:p1[0].toFixed(1),y1:p1[1].toFixed(1),x2:p2[0].toFixed(1),y2:p2[1].toFixed(1),
+      stroke:major?"#d8cbb0":"#6d7882","stroke-width":major?2.4:0.9},ticks);
+  }
+  ["XII","I","II","III","IV","V","VI","VII","VIII","IX","X","XI"].forEach(function(s,i){
+    if(i===3||i===6)return; // 3点日期窗 / 6点副盘占位
+    var p=pol(180,180,124,i*30),t=el("text",{x:p[0].toFixed(1),y:(p[1]+4).toFixed(1),"text-anchor":"middle",
+      fill:"#cfc2a8","font-size":i%3===0?20:17,"font-family":"Georgia,serif"},nums);
+    t.textContent=s;
+  });
+
+  /* ---------- 走时 ---------- */
+  var hHour=document.getElementById("hHour"),hMin=document.getElementById("hMin"),hSec=document.getElementById("hSec");
+  var secRing=document.getElementById("secRing"),digTime=document.getElementById("digTime"),digSec=document.getElementById("digSec");
+  function two(n){return n<10?"0"+n:""+n;}
+  function tick(){
+    var d=new Date(),h=d.getHours()%12,m=d.getMinutes(),s=d.getSeconds();
+    hHour.setAttribute("transform","rotate("+((h+m/60)*30)+" 180 180)");
+    hMin.setAttribute("transform","rotate("+((m+s/60)*6)+" 180 180)");
+    hSec.setAttribute("transform","rotate("+(s*6)+" 180 180)");
+    document.getElementById("dateWin").textContent=d.getDate();
+    digTime.textContent=two(d.getHours())+":"+two(m);
+    digSec.textContent=":"+two(s);
+    secRing.setAttribute("stroke-dasharray",(942*s/60).toFixed(1)+" 942");
+  }
+  tick();setInterval(tick,1000);
+
+  /* ---------- 天气：彩云 skycon → 图标 + 中文（WMO 码仍可作离线演示映射） ---------- */
+  var WEATHER=[
+    {code:0, name:"晴",   icon:"clear",  t:22, lo:16, hi:25},
+    {code:2, name:"多云", icon:"partly", t:19, lo:14, hi:22},
+    {code:3, name:"阴",   icon:"cloud",  t:16, lo:15, hi:19}, // 2026-11-14 21:00 上海实测值
+    {code:45,name:"雾",   icon:"fog",    t:11, lo:9,  hi:14},
+    {code:61,name:"小雨", icon:"rain",   t:12, lo:10, hi:14},
+    {code:71,name:"小雪", icon:"snow",   t:-2, lo:-5, hi:1},
+    {code:95,name:"雷雨", icon:"storm",  t:26, lo:23, hi:29}
+  ];
+  var wxIdx=2;
+  function paintWeather(){
+    var w=WEATHER[wxIdx],t=(w.t<0?"−":"")+Math.abs(w.t)+"°";
+    ["wxIconA","wxIconD"].forEach(function(id){
+      var u=document.getElementById(id);
+      u.setAttribute("href","#ic-"+w.icon);
+      u.setAttributeNS("http://www.w3.org/1999/xlink","xlink:href","#ic-"+w.icon);
+    });
+    ["wxTempA","wxTempD"].forEach(function(id){document.getElementById(id).textContent=t;});
+    ["wxDescA","wxDescD"].forEach(function(id){document.getElementById(id).textContent=w.name;});
+    document.getElementById("wxRangeD").textContent=w.lo+"/"+w.hi+"°";
+  }
+  paintWeather();
+  ["wxAnalog","wxDigital"].forEach(function(id){
+    document.getElementById(id).addEventListener("click",function(){wxIdx=(wxIdx+1)%WEATHER.length;paintWeather();});
+  });
+
+  /* ---------- 音乐页：极简三键 + 整屏黑胶转动 ---------- */
+  var SOURCES=[
+    {badge:"RADIO",station:"CITY FM 101.7"},
+    {badge:"PODCAST",station:"AI 硬件的下一站"},
+    {badge:"LOCAL SD",station:"Kind of Blue 01"}
+  ];
+  var srcIdx=0,playing=true,progress=0.38;
+  function paintSrc(){
+    document.getElementById("mSrc").textContent=SOURCES[srcIdx].badge+" · "+(playing?"PLAYING":"PAUSED");
+    document.getElementById("mStation").textContent=SOURCES[srcIdx].station;
+  }
+  function paintProgress(){
+    document.getElementById("playArc").setAttribute("stroke-dasharray",(1068*progress).toFixed(1)+" 1068");
+  }
+  paintSrc();paintProgress();
+  document.getElementById("vinyl").addEventListener("click",function(){srcIdx=(srcIdx+1)%SOURCES.length;paintSrc();});
+  document.getElementById("btnPlay").addEventListener("click",function(){
+    playing=!playing;
+    document.getElementById("icoPause").style.display=playing?"":"none";
+    document.getElementById("icoPlay").style.display=playing?"none":"";
+    document.getElementById("vinyl").classList.toggle("paused",!playing);
+    paintSrc();
+  });
+  function step(d){progress=(progress+d+1)%1;paintProgress();}
+  document.getElementById("btnPrev").addEventListener("click",function(){step(-0.12);});
+  document.getElementById("btnNext").addEventListener("click",function(){step(0.12);});
+  setInterval(function(){if(playing&&srcIdx!==0){progress=(progress+0.0015)%1;paintProgress();}},500);
+
+  /* ---------- 雷达页 ---------- */
+  var bearings=document.getElementById("bearings");
+  for(var a=0;a<360;a+=30){
+    var q1=pol(180,180,150,a),q2=pol(180,180,157,a);
+    el("line",{x1:q1[0].toFixed(1),y1:q1[1].toFixed(1),x2:q2[0].toFixed(1),y2:q2[1].toFixed(1),stroke:"#2b6b4e","stroke-width":1},bearings);
+    if(a%90===0){var q=pol(180,180,112,a),t=el("text",{x:q[0].toFixed(1),y:(q[1]+3.5).toFixed(1),"text-anchor":"middle",
+      fill:"#4b9c72","font-size":9,"font-family":"monospace"},bearings);t.textContent={0:"N",90:"E",180:"S",270:"W"}[a];}
+  }
+  var PLANES=[
+    {c:"CSZ9917",r:.60,b:38,trk:35,alt:9479,gs:1018,vr:-3.9,ty:"A320",reg:"B-30A6"},
+    {c:"DKH1170",r:.84,b:112,trk:210,alt:6200,gs:820,vr:0,ty:"A321",reg:"B-8391"},
+    {c:"CES5102",r:.40,b:205,trk:150,alt:3400,gs:610,vr:5.1,ty:"B738",reg:"B-1795"},
+    {c:"CCA1831",r:.71,b:288,trk:305,alt:11200,gs:890,vr:0,ty:"B77W",reg:"B-2047"},
+    {c:"CSN3406",r:.29,b:330,trk:75,alt:2100,gs:480,vr:-2.4,ty:"A333",reg:"B-8360",stale:true},
+    {c:"UAE306", r:.93,b:163,trk:340,alt:12100,gs:930,vr:0,ty:"B77L",reg:"A6-EWE"}
+  ];
+  // 演示优先：档位只保留大半径，默认 250 nm ≈ 463 km（实测国内近场稀疏）
+  var RANGES=[100,150,250],rangeIdx=2;
+  var SRC_R=["ADSB.LOL","OPENSKY","DEMO"],srcR=0;
+  var planesG=document.getElementById("planes"),detail=document.getElementById("detail");
+  function paintRadarSrc(){
+    document.getElementById("radarSrc").textContent=SRC_R[srcR]+" / 60s / "+Math.round(RANGES[rangeIdx]*1.852)+" KM";
+  }
+  function renderPlanes(){
+    planesG.textContent="";
+    PLANES.forEach(function(p){
+      var xy=pol(180,180,p.r*150,p.b);
+      var g=el("g",{class:"tap",transform:"translate("+xy[0].toFixed(1)+","+xy[1].toFixed(1)+")"},planesG);
+      el("circle",{cx:0,cy:0,r:12,fill:"transparent"},g);
+      el("path",{d:"M0 -7 L4.6 6 L0 3.4 L-4.6 6 Z",fill:p.stale?"#ffcc00":"#8dffc0",stroke:"#0d2c1e","stroke-width":.6,
+        transform:"rotate("+p.trk+")"},g);
+      var t=el("text",{x:10,y:-7,fill:p.stale?"#ffcc00":"#9de9bd","font-size":10.5,"font-family":"monospace"},g);
+      t.textContent=p.c.trim()+(p.stale?"*":"");
+      g.addEventListener("click",function(){
+        detail.style.display="";
+        // 详情卡片会盖住下半屏：暂时收起所有呼号，避免出现被切掉一半的文字
+        Array.prototype.forEach.call(planesG.querySelectorAll("text"),function(t){t.style.display="none";});
+        document.getElementById("dCall").textContent=p.c.trim()+(p.stale?" *":"");
+        document.getElementById("dSub").textContent="FL "+Math.round(p.alt*3.28084/100)+" · "+p.gs+" km/h · TRK "+p.trk+"°";
+        var dist=(p.r*RANGES[rangeIdx]*1.852).toFixed(0);
+        document.getElementById("dPos").textContent=dist+" km · "+("00"+p.b).slice(-3)+"° · "+(p.vr<-0.5?"descending":p.vr>0.5?"climbing":"level");
+        document.getElementById("dType").textContent=p.ty+" · "+p.reg+(p.stale?" · STALE":"");
+      });
+    });
+  }
+  renderPlanes();paintRadarSrc();
+  // 点雷达空白处关闭详情并恢复呼号
+  document.getElementById("svg-radar").addEventListener("click",function(e){
+    if(e.target.closest&&e.target.closest("#planes .tap"))return;
+    detail.style.display="none";
+    Array.prototype.forEach.call(planesG.querySelectorAll("text"),function(t){t.style.display="";});
+  });
+  document.getElementById("rangeSel").addEventListener("click",function(){
+    rangeIdx=(rangeIdx+1)%RANGES.length;
+    this.querySelector("text").textContent=RANGES[rangeIdx]+" nm ▾";
+    paintRadarSrc();renderPlanes();
+  });
+  document.getElementById("radarSrc").addEventListener("click",function(){
+    srcR=(srcR+1)%SRC_R.length;paintRadarSrc();
+  });
+
+  /* ---------- 番茄钟 ---------- */
+  var POMO=[
+    {name:"专注中",min:25,col:"#e2622e"},
+    {name:"短休息",min:5, col:"#4abe8c"},
+    {name:"长休息",min:15,col:"#4abe8c"}
+  ];
+  var pPhase=0,pRemain=25*60,pRunning=false,pRounds=0,pLast=Date.now();
+  function pomoTotal(){return POMO[pPhase].min*60;}
+  function paintPomo(){
+    var s=Math.max(0,Math.ceil(pRemain));
+    document.getElementById("pomoTime").textContent=("0"+Math.floor(s/60)).slice(-2)+":"+("0"+(s%60)).slice(-2);
+    document.getElementById("pomoState").textContent=POMO[pPhase].name;
+    document.getElementById("pomoState").setAttribute("fill",POMO[pPhase].col);
+    document.getElementById("pomoArc").setAttribute("stroke",POMO[pPhase].col);
+    document.getElementById("pomoArc").setAttribute("stroke-dasharray",(930*(1-pRemain/pomoTotal())).toFixed(1)+" 930");
+    document.getElementById("pomoRun").textContent=pRunning?"RUNNING":(pRemain===pomoTotal()?"READY":"PAUSED");
+    document.getElementById("pomoIcoPlay").style.display=pRunning?"none":"";
+    document.getElementById("pomoIcoPause").style.display=pRunning?"":"none";
+    Array.prototype.forEach.call(document.querySelectorAll("#pomoDots circle"),function(d,i){
+      d.setAttribute("fill",i<(pRounds%4)?"#e2622e":"#46506a");
+    });
+  }
+  function pomoNext(){
+    if(pPhase===0){pRounds++;pPhase=(pRounds%4===0)?2:1;}else pPhase=0;
+    pRemain=pomoTotal();pRunning=false;paintPomo();
+  }
+  setInterval(function(){
+    var now=Date.now(),dt=(now-pLast)/1000;pLast=now;
+    if(!pRunning)return;
+    pRemain-=dt;
+    if(pRemain<=0){pRemain=0;pRunning=false;pomoNext();}
+    else paintPomo();
+  },250);
+  document.getElementById("pomoMain").addEventListener("click",function(){pRunning=!pRunning;pLast=Date.now();paintPomo();});
+  document.getElementById("pomoReset").addEventListener("click",function(){pRemain=pomoTotal();pRunning=false;paintPomo();});
+  document.getElementById("pomoSkip").addEventListener("click",pomoNext);
+  paintPomo();
+
+  /* ---------- 页面切换 + 右侧说明 ---------- */
+  var PAGES=[
+    {e:"01 / WATCH FACE",t:"机械表盘",s:"三眼布局：3 点日期窗、6 点天气副盘；字号按物理毫米重排，最小 12 px。",
+     rows:[["渲染","背景刻度为预渲染位图；3 根指针用 <b>lv_img + set_angle</b> 旋转，1 Hz 更新，CPU 占用极低"],
+           ["走时","<b>PCF85063 RTC</b> 为主时钟，联网时每天 SNTP 校准一次；断网照走"],
+           ["天气","6 点副盘：30 px 图标 + <b>26 px 温度</b> + 13 px 状况；<b>彩云 v2.6</b> 30 min 轮询，skycon 本地映射成 7 组图标"],
+           ["字号","罗马数字 17–20 px、日期窗 21 px；删掉 7 px 品牌副标和底部小字（与刻度、VII/V 打架），底部留白"],
+           ["交互","单击切换电子表盘 · <b>点天气副盘循环 7 种天气</b> · 上滑进设置 · IMU 抬腕亮屏"]],
+     n:"<b>别用 LVGL 的 meter 控件</b>逐帧重绘 60 根刻度——QSPI 全屏刷会掉帧。静态底图 + 旋转精灵最稳。<b>实测坑</b>：副盘放指针下层时，每小时 25 分前后分针会正好压住温度数字，所以副盘必须画在指针上层（实心底盖住指针），信息优先于拟真。"},
+    {e:"02 / WATCH FACE",t:"电子表盘",s:"时间 68 px + 天气 32 px 的两段式版面，所有标签 ≥12 px。",
+     rows:[["字体","数字用等宽位图字体避免跳动；中文用 <b>lv_font_conv</b> 生成子集（约 200 字）放 Flash"],
+           ["秒环","外圈 r=150 的 arc，每秒更新 dash 长度；亮屏时才动，熄屏停刷"],
+           ["天气","42 px 图标 + <b>32 px 温度</b> + 16 px 状况 + 12 px 高低温，占下半屏；点击天气区循环 skycon"],
+           ["取舍","删掉两个带 6.5 px 标签的电量/音量副环，信息合并进底部一行 12 px 状态；字号放大必然要减元素"],
+           ["交互","左右滑在两套表盘间切换，长按进表盘选择"]],
+     n:"面板标称 262K 色，但 QSPI 常用 <b>RGB565</b>（65K），浅底大面积渐变会出色带，所以用平涂分层。文字统一加同底色描边，避免 r=150 秒环细线穿过笔画。"},
+    {e:"03 / AUDIO",t:"音乐播放 · 极简",s:"整屏黑胶转动做背景，只留三个大按键和两行文字；控制优先于信息。",
+     rows:[["视觉","<b>整屏黑胶</b>：同心沟槽 + 三段高光扇区随组旋转，暂停即停转；播放键 <b>r=48</b> 居中，是全页唯一焦点"],
+           ["按键","中央播放/暂停 r=48（外圈 r=62），左右切曲 r=28；全部落在 r≤158 安全区，单点触摸也好按"],
+           ["文字","只保留来源状态 + 曲名，删掉均衡器、码率、曲名副行等所有次要信息"],
+           ["链路","HTTP(S) 流 → PSRAM 环形缓冲 → 软解码 → I²S → ES8311 → PA；网络跑 Core 0，绘制/触摸跑 Core 1"]],
+     n:"<b>演示优先的取舍</b>：这页不追求信息量，追求一眼看出「能按哪儿」+ 黑胶在转。真实流播放接上后，控制键位与交互完全不用改。"},
+    {e:"04 / ADS-B",t:"航班雷达 · 演示优先",s:"大半径 + 演示兜底，保证任何时间屏幕上都有飞机；刷新降到 60 s。",
+     rows:[["主源","<b>api.adsb.lol/v2/point/{lat}/{lon}/{nm}</b> 免密钥；<b>60 s</b> 轮询（原 15 s），流量与配额都降 4 倍"],
+           ["半径","档位只留 <b>100 / 150 / 250 km</b>，默认 <b>250 km</b>；实测上海 100 nm 是空的、250 nm 才 26 架"],
+           ["兜底","实时目标 <b>&lt; 5 架就用内置演示目标补足</b>，按速度缓慢外推位置，屏幕永不空；演示目标用浅绿区分"],
+           ["解析","响应流式读前 64 KB 就够（密集区 250 nm 可达 332 KB），最多同屏 10 架，避免大 JSON 撑爆内存"]],
+     n:"<b>这条是演示性设计，不是纯功能</b>：宁可显示带 DEMO 标记的目标，也不要空屏。真实目标不插值，只有演示目标会缓慢移动。airplanes.live 已 403 剔除。"},
+    {e:"05 / FOCUS",t:"番茄钟",s:"25 / 5 / 15 三段循环，大倒计时 + 进度环，三个键全可点。",
+     rows:[["阶段","专注 25 min → 短休息 5 min，每 4 轮一次长休息 15 min；轮次点显示进度"],
+           ["计时","<b>millis() 软时钟</b>，不依赖网络；熄屏不停表。68 px 等宽数字，桌面视距清晰可读"],
+           ["按键","中央开始/暂停 r=32、左重置 r=23、右跳过 r=23；阶段切换时进度环换色"],
+           ["到点","切换阶段并显示 PHASE COMPLETE 4 s；有 ES8311 时可接提示音"]],
+     n:"番茄钟完全离线可用，是断网时最稳的一页。固件里用 millis() 累计 dt，不额外起硬件定时器。"}
+  ];
+  var cur=0;
+  function setPage(i){
+    if(i<0||i>PAGES.length-1)return;cur=i;
+    document.querySelectorAll(".screen").forEach(function(n){n.classList.toggle("active",+n.dataset.page===i);});
+    document.querySelectorAll(".tab").forEach(function(n){n.classList.toggle("active",+n.dataset.go===i);});
+    var p=PAGES[i];
+    document.getElementById("pEyebrow").textContent=p.e;
+    document.getElementById("pTitle").textContent=p.t;
+    document.getElementById("pSub").textContent=p.s;
+    document.getElementById("pRows").innerHTML=p.rows.map(function(r){return '<div class="row"><div class="k">'+r[0]+'</div><div class="v">'+r[1]+'</div></div>';}).join("");
+    document.getElementById("pNote").innerHTML=p.n;
+  }
+  document.querySelectorAll(".tab").forEach(function(b){b.addEventListener("click",function(){setPage(+b.dataset.go);});});
+  document.addEventListener("keydown",function(e){
+    if(e.key==="ArrowRight")setPage((cur+1)%PAGES.length);
+    if(e.key==="ArrowLeft")setPage((cur+PAGES.length-1)%PAGES.length);
+  });
+  var sx=null;
+  var glass=document.getElementById("glass");
+  glass.addEventListener("pointerdown",function(e){sx=e.clientX;});
+  glass.addEventListener("pointerup",function(e){
+    if(sx===null)return;var dx=e.clientX-sx;sx=null;
+    if(Math.abs(dx)>55)setPage((cur+(dx<0?1:PAGES.length-1))%PAGES.length);
+  });
+  document.getElementById("safeChk").addEventListener("change",function(){
+    document.getElementById("safety").classList.toggle("on",this.checked);
+  });
+  setPage(0);
+})();
+</script>
+</body>
+</html>

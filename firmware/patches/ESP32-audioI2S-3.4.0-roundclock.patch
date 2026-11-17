@@ -1,0 +1,118 @@
+--- a/ESP32-audioI2S/src/Audio.cpp
++++ b/ESP32-audioI2S/src/Audio.cpp
+@@ -22,6 +22,13 @@
+ #include "vorbis_decoder/vorbis_decoder.h"
+ #include "psram_unique_ptr.hpp"
+ 
++// [RoundClock patch 3/3] objective I2S diagnostics, read from audio_player.h
++// 0=write calls 1=timeouts 2=zero-byte writes 3=bytes consumed
++// 4=samples requested 5=samples handed to audio_process_i2s
++// 6=i2s_channel_init_std_mode err, 7=reconfig_std_gpio err
++// 8=i2s_channel_preload_data err, 9=i2s_channel_enable err (0x1000 = ESP_OK)
++volatile uint32_t gI2sDiag[10] = {0};
++
+ #define ANSI_ESC_RESET          "\033[0m"
+ #define ANSI_ESC_BLACK          "\033[30m"
+ #define ANSI_ESC_RED            "\033[31m"
+@@ -243,7 +250,14 @@
+     m_i2s_chan_cfg.role          = I2S_ROLE_MASTER;        // I2S controller master role, bclk and lrc signal will be set to output
+     m_i2s_chan_cfg.dma_desc_num  = 16;                     // number of DMA buffer
+     m_i2s_chan_cfg.dma_frame_num = 512;                    // I2S frame number in one DMA buffer.
+-    m_i2s_chan_cfg.auto_clear    = true;                   // i2s will always send zero automatically if no data to send
++    // [RoundClock patch 5/5] Keep auto_clear=true: when the TX FIFO runs empty
++    // IDF sends zeros instead of replaying the last DMA descriptor forever.
++    // With auto_clear=false, pauseResume() stops feeding but GDMA keeps looping
++    // the final buffer -> the user hears one short sample repeated endlessly.
++    // (The earlier "descriptor chain stops recycling" symptom was NOT caused by
++    // this flag; its real cause was the 2-byte preload in zeroI2Sbuff(), removed
++    // in patch 6/6. Verified: long playback with auto_clear=true has to=0 zero=0.)
++    m_i2s_chan_cfg.auto_clear    = true;
+     i2s_new_channel(&m_i2s_chan_cfg, &m_i2s_tx_handle, NULL);
+ 
+     m_i2s_std_cfg.slot_cfg                = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO); // Set to enable bit shift in Philips mode
+@@ -258,8 +272,15 @@
+     m_i2s_std_cfg.clk_cfg.sample_rate_hz = 48000;
+     m_i2s_std_cfg.clk_cfg.clk_src        = I2S_CLK_SRC_DEFAULT;        // Select PLL_F160M as the default source clock
+     m_i2s_std_cfg.clk_cfg.mclk_multiple  = I2S_MCLK_MULTIPLE_128;      // mclk = sample_rate * 256
+-    i2s_channel_init_std_mode(m_i2s_tx_handle, &m_i2s_std_cfg);
+-    I2Sstart();
++    gI2sDiag[6] = (uint32_t)(int32_t)i2s_channel_init_std_mode(m_i2s_tx_handle, &m_i2s_std_cfg) + 0x1000;
++    // [RoundClock patch 4/4] Do NOT enable the channel here.
++    // All GPIOs are still I2S_GPIO_UNUSED; enabling starts GDMA on a channel with
++    // no BCLK/WS/MCLK. setPinout() then disables + reconfigures + enables it again.
++    // That double enable leaves the GDMA descriptor chain in a bad state: the first
++    // ~57 KB are accepted, then every i2s_channel_write() times out with 0 bytes
++    // consumed (symptom: a short burst of sound, then permanent silence).
++    // setPinout() is now the one and only I2Sstart().
++    // I2Sstart();
+     m_sampleRate = m_i2s_std_cfg.clk_cfg.sample_rate_hz;
+ 
+     for(int i = 0; i < 3; i++) {
+@@ -298,7 +319,9 @@
+ //------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ esp_err_t Audio::I2Sstart() {
+     zeroI2Sbuff();
+-    return i2s_channel_enable(m_i2s_tx_handle);
++    esp_err_t e = i2s_channel_enable(m_i2s_tx_handle);
++    gI2sDiag[9] = (uint32_t)(int32_t)e + 0x1000;
++    return e;
+ }
+ 
+ esp_err_t Audio::I2Sstop() {
+@@ -309,9 +332,12 @@
+ }
+ //------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ void Audio::zeroI2Sbuff(){
+-    uint8_t buff[2] = {0, 0}; // From IDF V5 there is no longer the zero_dma_buff() function.
+-    size_t bytes_loaded = 0;  // As a replacement, we write a small amount of zeros in the buffer and thus reset the entire buffer.
+-    i2s_channel_preload_data(m_i2s_tx_handle, buff, 2, &bytes_loaded);
++    // [RoundClock patch 6/6] Upstream tries to "clear the DMA buffer" by preloading
++    // 2 bytes before every enable. On IDF 5.1 (esp32 core 3.0.7) this leaves the
++    // GDMA descriptor chain in a one-shot state: the first ~40-57 KB are drained,
++    // then i2s_channel_write() times out forever with 0 bytes consumed.
++    // i2s_channel_enable() already initialises the descriptors; skip the preload.
++    gI2sDiag[8] = 0x1000;
+ }
+ //------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ 
+@@ -2745,6 +2771,7 @@
+     if(audio_process_i2s) {
+         // processing the audio samples from external before forwarding them to i2s
+         bool continueI2S = false;
++        gI2sDiag[5] += m_plCh.samples48K;
+         audio_process_i2s((int16_t*)m_samplesBuff48K.get(), m_plCh.samples48K, &continueI2S); // 48KHz stereo 16bps
+         if(!continueI2S) {
+             m_plCh.samples48K = 0;
+@@ -2755,8 +2782,23 @@
+ 
+ i2swrite:
+ 
+-    m_plCh.err = i2s_channel_write(m_i2s_tx_handle, (int16_t*)m_samplesBuff48K.get() + m_plCh.count, m_plCh.samples48K * m_plCh.sampleSize, &m_plCh.i2s_bytesConsumed, 50);
++    // [RoundClock patch 1/2] give the DMA 200ms instead of 50ms to drain
++    m_plCh.err = i2s_channel_write(m_i2s_tx_handle, (int16_t*)m_samplesBuff48K.get() + m_plCh.count, m_plCh.samples48K * m_plCh.sampleSize, &m_plCh.i2s_bytesConsumed, 200);
++    gI2sDiag[0]++;
++    if(m_plCh.err == ESP_ERR_TIMEOUT) gI2sDiag[1]++;
++    if(m_plCh.i2s_bytesConsumed == 0) gI2sDiag[2]++;
++    gI2sDiag[3] += m_plCh.i2s_bytesConsumed;
++    gI2sDiag[4] += m_plCh.samples48K;
+     if( ! (m_plCh.err == ESP_OK || m_plCh.err == ESP_ERR_TIMEOUT)) goto exit;
++    // [RoundClock patch 2/2] upstream 3.4.0 deadlock: when the write times out with
++    // 0 bytes consumed, m_validSamples never reaches 0, so performAudioTask() stays
++    // in "while(m_validSamples) playChunk()" forever and stops decoding entirely.
++    // Symptom: a short burst of sound then permanent silence. Drop that chunk instead.
++    if(m_plCh.i2s_bytesConsumed == 0){
++        m_validSamples = 0;
++        m_plCh.count = 0;
++        return;
++    }
+     m_plCh.samples48K -= m_plCh.i2s_bytesConsumed / m_plCh.sampleSize;
+     m_plCh.count += m_plCh.i2s_bytesConsumed / 2;
+     if(m_plCh.samples48K <= 0) { m_validSamples = 0; m_plCh.count = 0; }
+@@ -5112,6 +5154,7 @@
+     gpio_cfg.ws = (gpio_num_t)LRC;
+     I2Sstop();
+     result = i2s_channel_reconfig_std_gpio(m_i2s_tx_handle, &gpio_cfg);
++    gI2sDiag[7] = (uint32_t)(int32_t)result + 0x1000;
+     I2Sstart();
+ 
+     return (result == ESP_OK);

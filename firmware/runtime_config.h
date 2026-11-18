@@ -66,7 +66,7 @@ static void cfgShow() {
   Serial.println("---- runtime config ----");
   Serial.printf("  WIFI_SSID   : %s\n", gCfg.ssid.c_str());
   Serial.printf("  WIFI_PASS   : %s\n", gCfg.pass.length() ? "********" : "(empty)");
-  Serial.printf("  CAIYUN_TOKEN: %s\n", gCfg.token.length() ? gCfg.token.c_str() : "(empty)");
+  Serial.printf("  CAIYUN_TOKEN: %s\n", gCfg.token.length() ? "SET" : "(empty)");
   Serial.printf("  BRIGHT      : %d %%   VOLUME: %d/21\n",
                 cfgGetInt("bright", BACKLIGHT_LEVEL), cfgGetInt("vol", 16));
   Serial.printf("  CITY        : %s  (%.5f, %.5f)   radar %d nm\n",
@@ -110,7 +110,7 @@ static void cfgHandle(const String &raw) {
     Serial.println("          Pomodoro: POMO <15|25|45> (focus preset; touch ignored while locked)");
     Serial.println("          TAP <x> <y> (inject a tap) | SWIPE <x1> <y1> <x2> <y2> (inject a swipe)");
     Serial.println("          MIC (state) | MICTEST [1..20] (record N s: samples/peak/rms) | MICPIN (pin edge diag)");
-    Serial.println("Cloud:    BAILIAN [key] | QWEN <text> | AI | ASRTODO | XZBIND | XZSTATUS");
+    Serial.println("Cloud:    BAILIAN [key] | QWEN <text> | AI | AICANCEL | ASRTODO | XZBIND | XZSTATUS");
     Serial.println("Gesture:  swipe LEFT/RIGHT on home -> app grid; swipe UP on any app -> home");
     Serial.println("          home shows ONLY the face picked in Settings (FACE card), not both");
     Serial.println("          pull DOWN from upper half -> settings on ANY page; push UP in settings -> back");

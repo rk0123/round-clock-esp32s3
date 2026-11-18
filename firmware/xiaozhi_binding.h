@@ -16,12 +16,7 @@
 #include <esp_partition.h>
 #include <esp_random.h>
 
-// Arduino-ESP32 3.0.7 包含 ESP-IDF 的根证书库。使用系统时间校验证书。
-extern const uint8_t cloudCaStart[] asm("_binary_x509_crt_bundle_start");
-extern const uint8_t cloudCaEnd[] asm("_binary_x509_crt_bundle_end");
-static void cloudUseCaBundle(WiFiClientSecure &client) {
-  client.setCACertBundle(cloudCaStart, cloudCaEnd - cloudCaStart);
-}
+#include "secure_http.h"
 
 enum class XzBinding : uint8_t { Idle, Fetching, Waiting, Bound, Offline, Failed, Expired };
 static std::atomic<XzBinding> gXzState{XzBinding::Idle};
@@ -116,7 +111,7 @@ static String xzDeviceInfo() {
   doc["chip_info"]["revision"] = chip.revision;
   doc["chip_info"]["features"] = chip.features;
   doc["application"]["name"] = "roundclock";
-  doc["application"]["version"] = "2.6.1";
+  doc["application"]["version"] = "2.6.2";
   doc["application"]["idf_version"] = app->idf_ver;
   doc["application"]["compile_time"] = String(app->date) + "T" + app->time + "Z";
   char elfHash[65];
@@ -187,9 +182,13 @@ static int xzPost(bool activate, String &response) {
   http.addHeader("Client-Id", gXzUuid);
   http.addHeader("Accept-Language", "zh-CN");
   http.addHeader("Content-Type", "application/json");
-  http.setUserAgent("esp32-s3-touch-lcd-1.85b/2.6.1");
+  http.setUserAgent("esp32-s3-touch-lcd-1.85b/2.6.2");
   int status = http.POST(std::move(body));
-  if (!activate && status == HTTP_CODE_OK && http.getSize() <= 8192) response = http.getString();
+  if (!activate && status == HTTP_CODE_OK) {
+    BoundedHttpBody reply(8192);
+    if (reply.receive(http)) response = std::move(static_cast<String &>(reply));
+    else { Serial.println("[XZ] response incomplete or too large"); status = HTTPC_ERROR_STREAM_WRITE; }
+  }
   if (status < 0) {
     char detail[96] = {};
     client.lastError(detail, sizeof(detail));

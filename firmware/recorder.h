@@ -11,18 +11,21 @@
 //  回放走 audio_player.h 的 AQ_PLAYFILE（gToneMode=true：播完就停，不续播不重连）。
 // ============================================================
 #include <SD_MMC.h>
+#include <memory>
 
 static void showToast(const char *s);   // 定义在 main.cpp（本头文件先于它展开）
 
 #define REC_DIR        "/REC"
 #define REC_MAX        24            // 列表最多列 24 段（UI 一页 4 条，够翻）
 #define REC_SR         16000
+static constexpr size_t REC_PATH_SIZE = 72;
 #define REC_BYTES_SEC  (REC_SR * 2)  // 16bit mono = 32000 B/s
 
 struct RecItem {
-  char     name[16];                 // REC0003.WAV（只存文件名）
+  char     name[64];                 // REC0003.WAV（只存文件名）
+  uint32_t number;
   uint32_t bytes;
-  uint16_t secs;
+  uint32_t secs;
 };
 
 static RecItem gRec[REC_MAX];
@@ -41,48 +44,51 @@ static void recSetMsg(const char *s) {
   gRecMsgUntil = millis() + 3000;
 }
 
-// 目录里已有编号的最大值 +1
-static int recNextNum() {
-  int mx = 0;
-  for (int i = 0; i < gRecN; i++) {
-    int n = atoi(gRec[i].name + 3);
-    if (n > mx) mx = n;
+// 编号只接受本机格式，列表也保留能完整打开的其他 WAV。
+static uint32_t recNumber(const char *name) {
+  if (strncasecmp(name, "REC", 3) != 0) return 0;
+  const char *p = name + 3;
+  uint32_t number = 0;
+  while (*p >= '0' && *p <= '9') {
+    const unsigned digit = *p++ - '0';
+    if (number > (UINT32_MAX - digit) / 10) return 0;
+    number = number * 10 + digit;
   }
-  return mx + 1;
+  return p - (name + 3) >= 4 && strcasecmp(p, ".WAV") == 0 ? number : 0;
 }
 
-static void recScan() {
+static uint32_t recScan() {
   gRecN = 0;
-  if (!tfEnsure()) { gRecPlaying = false; return; }
-  File d = SD_MMC.open(REC_DIR);
-  if (!d || !d.isDirectory()) return;
-  for (;;) {
-    File f = d.openNextFile();
-    if (!f) break;
-    if (!f.isDirectory() && gRecN < REC_MAX) {
-      String n = f.name();
-      String l = n; l.toLowerCase();
-      if (l.endsWith(".wav")) {
-        // 有的核心给的是带路径的名字，取最后一段
-        int sl = n.lastIndexOf('/');
-        if (sl >= 0) n = n.substring(sl + 1);
-        RecItem &it = gRec[gRecN++];
-        strncpy(it.name, n.c_str(), sizeof(it.name) - 1);
-        it.name[sizeof(it.name) - 1] = 0;
-        it.bytes = f.size();
-        it.secs = (it.bytes > 44) ? (uint16_t)((it.bytes - 44) / REC_BYTES_SEC) : 0;
-      }
-    }
-    f.close();
-  }
-  d.close();
-  // 编号大的新 → 倒序排，"最新"永远在 [0]
-  for (int i = 1; i < gRecN; i++) {
-    RecItem key = gRec[i]; int j = i - 1;
-    while (j >= 0 && strcmp(gRec[j].name, key.name) < 0) { gRec[j + 1] = gRec[j]; j--; }
-    gRec[j + 1] = key;
+  uint32_t maxNumber = 0;
+  if (!tfEnsure()) { gRecPlaying = false; gRecSel = 0; return 0; }
+  File dir = SD_MMC.open(REC_DIR);
+  if (!dir || !dir.isDirectory()) { gRecSel = 0; return 0; }
+
+  for (File file = dir.openNextFile(); file; file = dir.openNextFile()) {
+    if (file.isDirectory()) continue;
+    const char *name = file.name();
+    const char *slash = strrchr(name, '/');
+    if (slash) name = slash + 1;
+    const size_t len = strlen(name);
+    if (len < 5 || strcasecmp(name + len - 4, ".WAV") != 0) continue;
+
+    const uint32_t number = recNumber(name);
+    maxNumber = max(maxNumber, number);  // 每个 WAV 都纳入编号，显示窗口只保留最新的 24 条。
+    if (len >= sizeof(gRec[0].name)) continue;
+    int pos = 0;
+    while (pos < gRecN && (gRec[pos].number > number ||
+           (gRec[pos].number == number && strcasecmp(gRec[pos].name, name) > 0))) ++pos;
+    if (pos >= REC_MAX) continue;
+    if (gRecN < REC_MAX) ++gRecN;
+    for (int i = gRecN - 1; i > pos; --i) gRec[i] = gRec[i - 1];
+    RecItem &item = gRec[pos];
+    strlcpy(item.name, name, sizeof(item.name));
+    item.number = number;
+    item.bytes = file.size();
+    item.secs = item.bytes > 44 ? (item.bytes - 44) / REC_BYTES_SEC : 0;
   }
   if (gRecSel >= gRecN) gRecSel = 0;
+  return maxNumber;
 }
 
 static const char *recPathOf(int idx, char *buf, size_t cap) {
@@ -91,16 +97,36 @@ static const char *recPathOf(int idx, char *buf, size_t cap) {
   return buf;
 }
 
-// 把 gMicBuf 里 frames 个采样写成 WAV。返回写入的秒数（0 = 失败）
-static int recSaveFromMic(int frames) {
+struct RecWriteJob {
+  TfTransfer card;
+  File file;
+  int16_t *pcm = nullptr;
+  int frames = 0, offset = 0;
+  uint32_t number = 0;
+  char path[REC_PATH_SIZE], temporary[REC_PATH_SIZE];
+  ~RecWriteJob() { file.close(); free(pcm); }
+};
+static RecWriteJob *gRecWrite = nullptr;
+
+// 先建立文件，再把采音缓冲交给主循环分批写入。
+static bool recSaveFromMic(int frames) {
   gRecMsg[0] = 0;
-  if (!tfEnsure()) { recSetMsg("NO TF CARD"); return 0; }
-  if (!SD_MMC.exists(REC_DIR)) SD_MMC.mkdir(REC_DIR);
-  recScan();
-  char name[16];
-  snprintf(name, sizeof(name), "REC%04d.WAV", recNextNum());
-  char path[32];
-  snprintf(path, sizeof(path), REC_DIR "/%s", name);
+  if (gRecWrite || !gMicBuf || frames <= 0) return false;
+  std::unique_ptr<RecWriteJob> job(new (std::nothrow) RecWriteJob);
+  if (!job) { recSetMsg("内存不足"); return false; }
+  if (!job->card) { recSetMsg("NO TF CARD"); return false; }
+  if (!SD_MMC.exists(REC_DIR) && !SD_MMC.mkdir(REC_DIR)) {
+    recSetMsg("录音目录创建失败");
+    return false;
+  }
+
+  job->number = recScan();
+  do {
+    if (job->number == UINT32_MAX) { recSetMsg("录音编号已满"); return false; }
+    ++job->number;
+    snprintf(job->path, sizeof(job->path), REC_DIR "/REC%04lu.WAV", (unsigned long)job->number);
+    snprintf(job->temporary, sizeof(job->temporary), REC_DIR "/REC%04lu.TMP", (unsigned long)job->number);
+  } while (SD_MMC.exists(job->path) || SD_MMC.exists(job->temporary));
 
   uint32_t dataLen = (uint32_t)frames * 2;
   uint8_t h[44] = {0};
@@ -113,45 +139,62 @@ static int recSaveFromMic(int frames) {
   memcpy(h + 28, &byteRate, 4); memcpy(h + 32, &align, 2); memcpy(h + 34, &bits, 2);
   memcpy(h + 36, "data", 4); memcpy(h + 40, &dataLen, 4);
 
-  File f = SD_MMC.open(path, FILE_WRITE);
-  if (!f) {
-    recSetMsg("WRITE FAIL");
-    Serial.printf("[REC] open %s failed\n", path);
-    return 0;
-  }
-  bool written = f.write(h, sizeof(h)) == sizeof(h);
-  // 分块写：一次 1.9MB 的写会让主循环卡住好几秒（刷屏/触摸都停）
-  const int CH = 4096;
-  for (int i = 0; written && i < frames; i += CH) {
-    size_t bytes = min(frames - i, CH) * sizeof(int16_t);
-    written = f.write((const uint8_t *)(gMicBuf + i), bytes) == bytes;
-  }
-  f.close();
-  if (!written) {
-    SD_MMC.remove(path);
+  job->file = SD_MMC.open(job->temporary, FILE_WRITE);
+  if (!job->file) { recSetMsg("录音写入失败"); return false; }
+  if (job->file.write(h, sizeof(h)) != sizeof(h)) {
+    job->file.close();
+    SD_MMC.remove(job->temporary);
     recSetMsg("录音写入失败");
-    Serial.printf("[REC] incomplete write %s\n", path);
-    return 0;
+    return false;
   }
-  int secs = frames / REC_SR;
-  Serial.printf("[REC] saved %s (%u bytes, %d s)\n", path, (unsigned)(44 + dataLen), secs);
-  recScan();                     // 重新枚举，最新一条排到 [0]
-  gRecSel = 0;
-  {
-    char m[24]; snprintf(m, sizeof(m), "已存 %d 秒", secs);
-    recSetMsg(m);
-  }
-  return secs;
+  job->frames = frames;
+  job->pcm = micTakeBuffer();
+  gRecWrite = job.release();
+  recSetMsg("保存中");
+  return true;
 }
 
-// 读第 idx 段录音的 PCM（跳过 44 字节头）到 PSRAM，给 ASR 用。返回帧数，失败返回 nullptr
-static int16_t *recLoadPcm(int idx, int *framesOut) {
-  *framesOut = 0;
-  char path[32];
-  recPathOf(idx, path, sizeof(path));
-  if (!path[0]) return nullptr;
-  File f = SD_MMC.open(path);
-  if (!f) { Serial.printf("[REC] open %s failed\n", path); return nullptr; }
+static void recPollSave() {
+  if (!gRecWrite) return;
+  RecWriteJob &job = *gRecWrite;
+  const int frames = min(job.frames - job.offset, 4096);
+  const size_t bytes = frames * sizeof(int16_t);
+  const bool written = job.file.write((const uint8_t *)(job.pcm + job.offset), bytes) == bytes;
+  job.offset += frames;
+  if (written && job.offset < job.frames) return;
+
+  job.file.close();
+  if (!written) {
+    SD_MMC.remove(job.temporary);
+    recSetMsg("录音写入失败");
+    Serial.printf("[REC] incomplete write %s\n", job.temporary);
+  } else if (SD_MMC.exists(job.path) || !SD_MMC.rename(job.temporary, job.path)) {
+    recSetMsg("录音保存失败");
+    Serial.printf("[REC] rename failed, PCM kept in %s\n", job.temporary);
+  } else {
+    const uint32_t totalBytes = 44 + job.frames * sizeof(int16_t);
+    const int secs = job.frames / REC_SR;
+    if (gRecN < REC_MAX) ++gRecN;
+    for (int i = gRecN - 1; i > 0; --i) gRec[i] = gRec[i - 1];
+    RecItem &item = gRec[0];
+    strlcpy(item.name, job.path + sizeof(REC_DIR), sizeof(item.name));
+    item.number = job.number;
+    item.bytes = totalBytes;
+    item.secs = secs;
+    gRecSel = 0;
+    char message[24];
+    snprintf(message, sizeof(message), "已存 %d 秒", secs);
+    recSetMsg(message);
+    Serial.printf("[REC] saved %s (%u bytes, %d s)\n", job.path, (unsigned)totalBytes, secs);
+  }
+  delete gRecWrite;
+  gRecWrite = nullptr;
+}
+
+// 打开本机录音并验证 PCM 头，文件停在 PCM 数据起点。
+static bool recOpenPcm(const char *path, File &f, int &frames) {
+  f = SD_MMC.open(path);
+  if (!f) { Serial.printf("[REC] open %s failed\n", path); return false; }
   uint8_t header[44];
   uint32_t dataLen = 0, sampleRate = 0;
   if (f.read(header, sizeof(header)) == sizeof(header)) {
@@ -164,15 +207,10 @@ static int16_t *recLoadPcm(int idx, int *framesOut) {
       memcmp(header + 36, "data", 4) || header[20] != 1 || header[21] != 0 ||
       header[22] != 1 || header[23] != 0 || header[34] != 16 || header[35] != 0) {
     Serial.printf("[REC] unsupported or incomplete WAV %s\n", path);
-    return nullptr;
+    return false;
   }
-  int16_t *pcm = (int16_t *)ps_malloc(dataLen);
-  if (!pcm) { Serial.println("[REC] pcm alloc failed"); return nullptr; }
-  size_t got = f.read((uint8_t *)pcm, dataLen);
-  if (got != dataLen) { free(pcm); return nullptr; }
-  *framesOut = dataLen / sizeof(*pcm);
-  Serial.printf("[REC] loaded %s: %d frames (%.1f s)\n", path, *framesOut, *framesOut / 16000.0f);
-  return pcm;
+  frames = dataLen / sizeof(int16_t);
+  return frames >= 1600;
 }
 
 // ---------------- 播放 / 停止 ----------------
@@ -189,9 +227,12 @@ static bool recIsPlaying() {
 static void recPlaySel() {
   if (gRecN == 0) { showToast("还没有录音"); return; }
   if (gAiState == AVS_RECORDING) { showToast("先停止录音"); return; }
-  char path[32];
+  char path[REC_PATH_SIZE];
   recPathOf(gRecSel, path, sizeof(path));
-  audSend(AQ_PLAYFILE, 0, 0, path);
+  if (!path[0] || !audSend(AQ_PLAYFILE, 0, 0, path)) {
+    showToast("播放请求失败");
+    return;
+  }
   gRecPlaying = true;
   gRecPlayStartMs = millis();
   gRecMsg[0] = 0;
@@ -213,18 +254,24 @@ static void recTogglePlay() {
 
 // ---------------- 录音 / 停止 ----------------
 // 与 aiVoiceToggle 的区别：**不自动转写**。停 = micStop + 写卡 + 回列表。
-static void recToggleRecord() {
+static void recToggleRecord(uint32_t limitMs) {
+  if (gRecWrite) { showToast("录音保存中"); render(); return; }
   if (gAiState == AVS_PROCESSING) return;
   if (gAiState == AVS_RECORDING) {
     if (!gAiRecToFile) { showToast("请先结束语音录音"); render(); return; }
     micStop();
     int frames = gMicN.load();
+    int peak, rms;
+    micLevel(peak, rms);
+    Serial.printf("[REC] captured %d samples peak=%d rms=%d\n", frames, peak, rms);
     gAiState = AVS_IDLE;
     if (frames < 3200) {                 // 不足 0.2 秒当误触，别往卡里写垃圾
+      micReleaseBuffer();
       recSetMsg(frames ? "太短 没存" : "麦克风无采样");
       render(); return;
     }
     recSaveFromMic(frames);
+    micReleaseBuffer();
     render(); return;
   }
   // 开始：先停回放（同一组 I2S0，边放边录就是啸叫），再开麦
@@ -232,8 +279,12 @@ static void recToggleRecord() {
   gAiTranscript = ""; gAiResult = "";    // 新的一段清掉上一段的纪要
   gAiMode = AVM_MEETING;
   gAiRecToFile = true;                                // 停 = 存卡，不自动转写
-  gAiRecLimitMs = (uint32_t)(MIC_MAX_SAMPLES / 16);   // 60 秒自动停
-  if (!micBegin()) { showToast("麦克风初始化失败"); return; }
+  gAiRecLimitMs = limitMs;
+  if (!micBegin(30, limitMs * 16U)) {
+    micReleaseBuffer();
+    showToast("麦克风初始化失败");
+    return;
+  }
   gRecMsg[0] = 0;
   gAiRecStartMs = millis();
   gAiState = AVS_RECORDING;
@@ -242,23 +293,19 @@ static void recToggleRecord() {
 
 // 纪要（可选）：把选中的 WAV 读回 PCM → 后台 ASR + Qwen
 static void recMakeMinutes() {
-  if (gAiState == AVS_PROCESSING) { showToast("正在生成"); return; }
+  if (gRecWrite || gAiState == AVS_PROCESSING) { showToast("任务进行中"); return; }
   if (gAiState == AVS_RECORDING) { showToast("先停止录音"); return; }
   if (gRecN == 0) { showToast("还没有录音"); return; }
   if (!tfEnsure()) { showToast("NO TF CARD"); return; }
-  int frames = 0;
-  int16_t *pcm = recLoadPcm(gRecSel, &frames);
-  if (!pcm || frames < 1600) {
-    if (pcm) free(pcm);
-    showToast("读取失败");
-    return;
-  }
+  char path[REC_PATH_SIZE];
+  recPathOf(gRecSel, path, sizeof(path));
+  if (!path[0]) { showToast("读取失败"); return; }
   gAiTranscript = ""; gAiResult = "";
-  if (!aiQueueVoice(AVM_MEETING, frames, pcm)) {
-    showToast("内存不足");
+  if (!aiQueueVoice(AVM_MEETING, 0, nullptr, "", path)) {
+    showToast("任务启动失败");
     return;
   }
-  Serial.printf("[REC] minutes for %d/%d (%d frames)\n", gRecSel + 1, gRecN, frames);
+  Serial.printf("[REC] minutes for %s\n", path);
 }
 
 // ---------------- 串口验收 ----------------
@@ -276,18 +323,17 @@ static void recCmd(const String &cmd) {
     int secs = cmd.length() > 6 ? cmd.substring(6).toInt() : 5;
     if (secs < 1) secs = 5;
     if (secs > 60) secs = 60;
-    if (!micBegin()) { Serial.println("[REC] mic begin failed"); return; }
-    delay(secs * 1000);
-    micStop();
-    int peak, rms; micLevel(peak, rms);
-    Serial.printf("[REC] captured %d samples peak=%d rms=%d\n", gMicN.load(), peak, rms);
-    recSaveFromMic(gMicN.load());
+    if (gAiState == AVS_RECORDING || gAiState == AVS_PROCESSING || gRecWrite) {
+      Serial.println("[REC] busy");
+      return;
+    }
+    recToggleRecord(secs * 1000UL);
     return;
   }
   if (cmd.startsWith("RECPLAY")) {             // RECPLAY [序号，1 起]
     recScan();
     int i = cmd.length() > 7 ? cmd.substring(7).toInt() - 1 : 0;
-    if (i < 0) i = 0;
+    if (i < 0 || i >= gRecN) { Serial.println("[REC] bad index"); return; }
     gRecSel = i;
     recPlaySel();
     return;
@@ -296,7 +342,7 @@ static void recCmd(const String &cmd) {
   if (cmd.startsWith("RECMIN")) {              // RECMIN [序号]：跑纪要
     recScan();
     int i = cmd.length() > 6 ? cmd.substring(6).toInt() - 1 : 0;
-    if (i < 0) i = 0;
+    if (i < 0 || i >= gRecN) { Serial.println("[REC] bad index"); return; }
     gRecSel = i;
     recMakeMinutes();
     return;
@@ -305,7 +351,8 @@ static void recCmd(const String &cmd) {
     recScan();
     int i = cmd.length() > 6 ? cmd.substring(6).toInt() - 1 : 0;
     if (i < 0 || i >= gRecN) { Serial.println("[REC] bad index"); return; }
-    char path[32]; recPathOf(i, path, sizeof(path));
+    if (recIsPlaying() || gRecWrite || gAiState == AVS_PROCESSING) { Serial.println("[REC] busy"); return; }
+    char path[REC_PATH_SIZE]; recPathOf(i, path, sizeof(path));
     Serial.printf("[REC] remove %s -> %d\n", path, (int)SD_MMC.remove(path));
     recScan();
     return;

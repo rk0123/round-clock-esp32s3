@@ -17,6 +17,7 @@ static i2s_chan_handle_t gMicChan   = nullptr;   // I2S0 的 RX handle（属于�
 static bool              gMicReady  = false;     // RX 通道是否已 init_std_mode
 static es7210_dev_handle_t gMicCodec= nullptr;
 static int16_t *gMicBuf = nullptr;
+static int gMicCapacity = 0;
 static std::atomic<int> gMicN{0};
 static std::atomic<bool> gMicOn{false};
 static std::atomic<bool> gMicTaskActive{false};
@@ -27,13 +28,13 @@ static void micTask(void *) {
   int count = 0;
   int dec = 0, sum = 0;
   esp_err_t lastError = ESP_OK;
-  while (gMicOn.load() && count < MIC_MAX_SAMPLES) {
+  while (gMicOn.load() && count < gMicCapacity) {
     size_t got = 0;
     esp_err_t status = i2s_channel_read(gMicChan, raw, sizeof(raw), &got, 50);
     if (status != ESP_OK) lastError = status;
     if (status != ESP_OK && status != ESP_ERR_TIMEOUT) { delay(5); continue; }
     const int frames = got / (2 * sizeof(int16_t));
-    for (int i = 0; i < frames && count < MIC_MAX_SAMPLES; ++i) {
+    for (int i = 0; i < frames && count < gMicCapacity; ++i) {
       sum += raw[i * 2];
       if (++dec == 3) {
         gMicBuf[count++] = sum / 3;
@@ -78,7 +79,7 @@ static void micPinEdges(uint32_t ms, const char *tag) {
                 tag, cnt[0], cnt[1], cnt[2], (unsigned long)ms);
 }
 
-static bool micBegin(int gainDb = 30) {
+static bool micBegin(int gainDb = 30, int capacity = MIC_MAX_SAMPLES) {
   if (gMicOn.load()) return false;
   if (!gAudioReady || !gAudio) { Serial.println("[MIC] audio subsystem not ready"); return false; }
   gMicChan = gAudio->getRxHandle();
@@ -86,9 +87,14 @@ static bool micBegin(int gainDb = 30) {
     Serial.println("[MIC] RX handle missing, check ESP32-audioI2S full-duplex patch");
     return false;
   }
-  if (gAudioState == A_PLAYING || gAudioState == A_CONNECTING) audioStop();
-  if (!gMicBuf) gMicBuf = (int16_t *)ps_malloc(MIC_MAX_SAMPLES * sizeof(int16_t));
+  capacity = constrain(capacity, 1600, MIC_MAX_SAMPLES);
+  if (capacity != gMicCapacity) {
+    free(gMicBuf);
+    gMicBuf = (int16_t *)ps_malloc(capacity * sizeof(int16_t));
+    gMicCapacity = gMicBuf ? capacity : 0;
+  }
   if (!gMicBuf) { Serial.println("[MIC] PSRAM alloc FAILED"); return false; }
+  if (!audioBeginCapture()) return false;
 
   // ES7210 全部 I2C 操作都在总线锁内（触摸任务 100Hz 也用 Wire）
   I2C_Lock();
@@ -123,6 +129,7 @@ static bool micBegin(int gainDb = 30) {
   if (e != ESP_OK) {
     Serial.printf("[MIC] ES7210 config failed err=0x%x\n", (int)e);
     micFreeCodec();
+    audioEndCapture();
     return false;
   }
 
@@ -147,6 +154,7 @@ static bool micBegin(int gainDb = 30) {
     if (e != ESP_OK) {
       Serial.printf("[MIC] rx init_std_mode failed 0x%x\n", (int)e);
       micFreeCodec();
+      audioEndCapture();
       return false;
     }
     gMicReady = true;
@@ -155,6 +163,7 @@ static bool micBegin(int gainDb = 30) {
   if (e != ESP_OK) {
     Serial.printf("[MIC] rx enable failed 0x%x\n", (int)e);
     micFreeCodec();
+    audioEndCapture();
     return false;
   }
 
@@ -166,6 +175,7 @@ static bool micBegin(int gainDb = 30) {
     gMicOn.store(false);
     i2s_channel_disable(gMicChan);
     micFreeCodec();
+    audioEndCapture();
     Serial.println("[MIC] task creation failed");
     return false;
   }
@@ -179,8 +189,19 @@ static void micStop() {
   while (gMicTaskActive.load()) delay(2);
   i2s_channel_disable(gMicChan);
   micFreeCodec();
+  audioEndCapture();
   Serial.printf("[MIC] stopped, %d samples\n", gMicN.load());
 }
+
+// 调用方先停采音，再取得 PCM 所有权。
+static int16_t *micTakeBuffer() {
+  int16_t *samples = gMicBuf;
+  gMicBuf = nullptr;
+  gMicCapacity = 0;
+  return samples;
+}
+
+static void micReleaseBuffer() { free(micTakeBuffer()); }
 
 // 返回最近 200ms 的峰值 / RMS，给录音页画电平条
 static void micLevel(int &peak, int &rms) {
@@ -212,6 +233,7 @@ static void micCmd(const String &cmd) {
     if (micBegin()) {
       micPinEdges(150, "afterBegin");
       micStop();
+      micReleaseBuffer();
       micPinEdges(150, "afterStop");
     }
     return;
@@ -220,7 +242,7 @@ static void micCmd(const String &cmd) {
     int secs = cmd.length() > 8 ? cmd.substring(8).toInt() : 3;
     if (secs < 1) secs = 3;
     if (secs > 60) secs = 60;
-    if (!micBegin()) return;
+    if (!micBegin(30, secs * 16000)) return;
     delay(secs * 1000);
     micStop();
     int peak, rms; micLevel(peak, rms);
@@ -228,6 +250,7 @@ static void micCmd(const String &cmd) {
     Serial.print("[MIC] first16:");
     for (int i = 0; i < min(16, gMicN.load()); i++) Serial.printf(" %d", gMicBuf[i]);
     Serial.println();
+    micReleaseBuffer();
     return;
   }
 }

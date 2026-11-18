@@ -15,6 +15,7 @@
 #include <esp_random.h>
 #include <mbedtls/sha1.h>
 static void render();
+static void showToast(const char *s);
 
 // ⚠ 凭据必须在 setup() 里加载（cloudLoadCreds），不能写成全局静态初始化：
 //   全局构造发生在 nvs_flash_init 之前，cfgGetStr 必然返回空串，而且之后再也不会重读 ——
@@ -218,38 +219,57 @@ static int gTodoN = 0;
 
 static uint32_t todoNow() { return (uint32_t)time(nullptr); }
 
-// 本地时间 → epoch 秒。设备时区已由 configTime 设好，mktime 走同一套时区。
+// 本地时间 → epoch。拒绝会被 mktime 自动进位的非法日期。
 static uint32_t todoMakeEpoch(int y, int mo, int d, int h, int mi) {
-  if (y < 2000 || y > 2100 || mo < 1 || mo > 12 || d < 1 || d > 31) return 0;
-  struct tm t; memset(&t, 0, sizeof(t));
+  if (y < 2000 || y > 2100 || mo < 1 || mo > 12 || d < 1 || d > 31 ||
+      h < 0 || h > 23 || mi < 0 || mi > 59) return 0;
+  struct tm t = {};
   t.tm_year = y - 1900; t.tm_mon = mo - 1; t.tm_mday = d;
-  t.tm_hour = constrain(h, 0, 23); t.tm_min = constrain(mi, 0, 59);
-  return (uint32_t)mktime(&t);
+  t.tm_hour = h; t.tm_min = mi; t.tm_isdst = -1;
+  time_t result = mktime(&t);
+  if (result < 0 || result > UINT32_MAX || t.tm_year != y - 1900 || t.tm_mon != mo - 1 ||
+      t.tm_mday != d || t.tm_hour != h || t.tm_min != mi) return 0;
+  return (uint32_t)result;
 }
-// 解析 "2026-11-18 15:00" / "2026-11-18" / "+3"（3 天后）
+
 static uint32_t todoParseDeadline(const String &s) {
   String v = s; v.trim();
-  if (!v.length()) return 0;
-  if (v[0] == '+') {
-    int days = v.substring(1).toInt();
-    if (days < 0 || days > 3650) return 0;
-    return todoNow() + (uint32_t)days * 86400UL;
+  const char *text = v.c_str();
+  if (*text == '+') {
+    const char *digits = text + 1;
+    char *end;
+    if (*digits < '0' || *digits > '9') return 0;
+    long days = strtol(digits, &end, 10);
+    if (*end || days > 3650) return 0;
+    uint64_t at = todoNow() + (uint64_t)days * 86400;
+    return at <= UINT32_MAX ? (uint32_t)at : 0;
   }
-  int y = v.substring(0, 4).toInt();
-  int mo = v.substring(5, 7).toInt();
-  int d = v.substring(8, 10).toInt();
-  int h = v.length() > 11 ? v.substring(11, 13).toInt() : 18;
-  int mi = v.length() > 14 ? v.substring(14, 16).toInt() : 0;
-  return todoMakeEpoch(y, mo, d, h, mi);
+  int y, mo, d, h, mi, len = 0;
+  if (sscanf(text, "%4d-%2d-%2d %2d:%2d%n", &y, &mo, &d, &h, &mi, &len) == 5 &&
+      text[len] == 0) return todoMakeEpoch(y, mo, d, h, mi);
+  if (sscanf(text, "%4d-%2d-%2d%n", &y, &mo, &d, &len) == 3 && text[len] == 0)
+    return todoMakeEpoch(y, mo, d, 18, 0);
+  return 0;
 }
-// 格式化成清单行内短标签："今天" / "明天" / "3天后" / "逾期2天" / "11/25"
+
+static int todoDayNumber(const struct tm &local) {
+  int y = local.tm_year + 1899;
+  return 365 * y + y / 4 - y / 100 + y / 400 + local.tm_yday;
+}
+
 static void todoDeadlineLabel(uint32_t dl, char *buf, int n, uint16_t &col) {
   col = COL(110, 128, 146);
   if (!dl) { snprintf(buf, n, "-"); return; }
-  int32_t diff = (int32_t)(dl - todoNow());   // 秒，正=未来
-  int days = diff / 86400;
-  if (diff < 0) {
-    snprintf(buf, n, "逾期%d天", -days < 1 ? 1 : -days);
+  const time_t now = todoNow(), due = dl;
+  struct tm today, deadline;
+  if (!localtime_r(&now, &today) || !localtime_r(&due, &deadline)) {
+    snprintf(buf, n, "-");
+    return;
+  }
+  const int days = todoDayNumber(deadline) - todoDayNumber(today);
+  if (due < now) {
+    if (days < 0) snprintf(buf, n, "逾期%d天", -days);
+    else snprintf(buf, n, "已逾期");
     col = COL(240, 110, 100);
   } else if (days == 0) {
     snprintf(buf, n, "今天"); col = C_ORANGE;
@@ -258,12 +278,47 @@ static void todoDeadlineLabel(uint32_t dl, char *buf, int n, uint16_t &col) {
   } else if (days <= 30) {
     snprintf(buf, n, "%d天后", days); col = COL(120, 190, 150);
   } else {
-    struct tm t; time_t tt = dl; localtime_r(&tt, &t);
-    snprintf(buf, n, "%d/%d", t.tm_mon + 1, t.tm_mday);
+    snprintf(buf, n, "%d/%d", deadline.tm_mon + 1, deadline.tm_mday);
   }
 }
 
+struct TodoSnapshot {
+  uint8_t version;
+  uint8_t count;
+  uint8_t reserved[2];
+  TodoItem items[TODO_MAX];
+};
+
+static bool todoSave() {
+  TodoSnapshot snapshot = {};
+  snapshot.version = 1;
+  snapshot.count = gTodoN;
+  const size_t len = offsetof(TodoSnapshot, items) + gTodoN * sizeof(TodoItem);
+  memcpy(snapshot.items, gTodos, gTodoN * sizeof(TodoItem));
+  Preferences prefs;
+  if (prefs.begin("rcfg", false) && prefs.putBytes("todo.v1", &snapshot, len) == len) return true;
+  Serial.println("[TODO] snapshot save failed");
+  return false;
+}
+
 static void todoLoad() {
+  {
+    Preferences prefs;
+    if (prefs.begin("rcfg", true) && prefs.isKey("todo.v1")) {
+      TodoSnapshot snapshot = {};
+      const size_t len = prefs.getBytesLength("todo.v1");
+      if (len >= offsetof(TodoSnapshot, items) && len <= sizeof(snapshot) &&
+          prefs.getBytes("todo.v1", &snapshot, len) == len &&
+          snapshot.version == 1 && snapshot.count <= TODO_MAX &&
+          len == offsetof(TodoSnapshot, items) + snapshot.count * sizeof(TodoItem)) {
+        gTodoN = snapshot.count;
+        memcpy(gTodos, snapshot.items, gTodoN * sizeof(TodoItem));
+        for (int i = 0; i < gTodoN; ++i) gTodos[i].text[sizeof(gTodos[i].text) - 1] = 0;
+        return;
+      }
+    }
+  }
+  // 兼容旧索引和旧条目键。下一次修改时用一个快照提交。
   gTodoN = constrain(cfgGetInt("todo.n", 0), 0, TODO_MAX);
   for (int i = 0; i < gTodoN; i++) {
     char key[16];
@@ -287,19 +342,14 @@ static void todoLoad() {
     gTodos[i].ts = 0;
   }
 }
-static void todoSave() {
-  cfgSetInt("todo.n", gTodoN);
-  for (int i = 0; i < gTodoN; i++) {
-    char key[16], val[136];
-    snprintf(key, sizeof(key), "todo.%d", i);
-    snprintf(val, sizeof(val), "%d|%lu|%s", gTodos[i].done,
-             (unsigned long)gTodos[i].deadline, gTodos[i].text);
-    gPrefs.begin("rcfg", false);
-    gPrefs.putString(key, val);
-    gPrefs.end();
-  }
+static bool todoCommit() {
+  if (todoSave()) return true;
+  todoLoad();
+  showToast("待办保存失败");
+  return false;
 }
-static void todoAdd(const char *text, uint32_t deadline = 0) {
+
+static void todoAppend(const char *text, uint32_t deadline) {
   if (!text || !*text) return;
   if (gTodoN >= TODO_MAX) {
     // 满了就挤掉最早一条已完成的，否则挤掉最早一条
@@ -309,23 +359,24 @@ static void todoAdd(const char *text, uint32_t deadline = 0) {
     gTodoN--;
   }
   memset(&gTodos[gTodoN], 0, sizeof(TodoItem));
-  strlcpy(gTodos[gTodoN].text, text, sizeof(gTodos[gTodoN].text));
+  size_t len = min(strlen(text), sizeof(gTodos[gTodoN].text) - 1);
+  while (len && ((uint8_t)text[len] & 0xc0) == 0x80) --len;
+  memcpy(gTodos[gTodoN].text, text, len);
   gTodos[gTodoN].done = 0;
   gTodos[gTodoN].ts = (uint32_t)(millis() / 1000);
   gTodos[gTodoN].deadline = deadline;
   gTodoN++;
-  todoSave();
 }
 static void todoToggle(int i) {
   if (i < 0 || i >= gTodoN) return;
   gTodos[i].done = !gTodos[i].done;
-  todoSave();
+  todoCommit();
 }
 static void todoDel(int i) {
   if (i < 0 || i >= gTodoN) return;
   for (int k = i; k < gTodoN - 1; k++) gTodos[k] = gTodos[k + 1];
   gTodoN--;
-  todoSave();
+  todoCommit();
 }
 // 去重：同一条待办已存在（未勾选）就不再重复加；
 // 若已存在但此前无期限、这次带上了期限，则补写期限并返回 true（算一次更新）。
@@ -336,12 +387,12 @@ static bool todoAddUnique(const char *text, uint32_t deadline = 0) {
   for (int i = 0; i < gTodoN; i++) {
     if (!gTodos[i].done && strcmp(gTodos[i].text, t.c_str()) == 0) {
       if (deadline && !gTodos[i].deadline) {
-        gTodos[i].deadline = deadline; todoSave(); return true;
+        gTodos[i].deadline = deadline; return true;
       }
       return false;
     }
   }
-  todoAdd(t.c_str(), deadline);
+  todoAppend(t.c_str(), deadline);
   return true;
 }
 // 从行尾剥出 "@2026-11-18 15:00" / "@+3" 这种期限标记，返回 epoch（0=没有）
@@ -365,20 +416,25 @@ static int todoAddLines(const String &lines, int maxItems) {
     // Qwen 偶尔带 "- " / 序号 / 空行，统一剥掉
     if (line.startsWith("- ")) line = line.substring(2);
     if (line.startsWith("· ")) line = line.substring(2);
-    int d = 0;
-    while (d < line.length() && (line[d] == ' ' || (line[d] >= '0' && line[d] <= '9')
-                                 || line[d] == '.' || line[d] == '、')) d++;
-    if (d > 0 && d < line.length() && line[d] != ' ') line = line.substring(d);
+    unsigned int digits = 0;
+    while (digits < line.length() && line[digits] >= '0' && line[digits] <= '9') ++digits;
+    if (digits > 0 && digits < line.length()) {
+      String suffix = line.substring(digits);
+      if (suffix.startsWith("、")) line = suffix.substring(strlen("、"));
+      else if (suffix.startsWith(". ") || suffix.startsWith(") ")) line = suffix.substring(2);
+    }
     line.trim();
     if (!line.length()) continue;
     if (line == "无" || line == "没有待办" || line == "无待办" || line == "暂无") continue;
     if (todoAddUnique(line.c_str(), dl)) added++;
   }
+  if (added && !todoCommit()) return -1;
   return added;
 }
 
 // ---------------- 百炼 ASR：Paraformer-realtime-v2 ----------------
 static String gAsrErr;
+static std::atomic<bool> gAiCancel{false};
 
 class AsrSession {
  public:
@@ -430,8 +486,9 @@ class AsrSession {
   const char *id;
 };
 
-static String asrTranscribe(const int16_t *pcm, int frames, const String &key) {
+static String asrTranscribe(const int16_t *pcm, int frames, const String &key, File *wav) {
   gAsrErr = "";
+  if (gAiCancel.load()) { gAsrErr = "CANCELLED"; return ""; }
   if (!key.length()) { gAsrErr = "NO_KEY"; return ""; }
   if (WiFi.status() != WL_CONNECTED) { gAsrErr = "NO_WIFI"; return ""; }
 
@@ -465,15 +522,25 @@ static String asrTranscribe(const int16_t *pcm, int frames, const String &key) {
 
   uint32_t until = millis() + 8000;
   while (!session.started && (int32_t)(until - millis()) > 0) {
+    if (gAiCancel.load()) { gAsrErr = "CANCELLED"; return ""; }
     if (!session.read(ws, 200)) return "";
   }
   if (!session.started) { gAsrErr = "START_TIMEOUT"; return ""; }
 
   // 每帧发送 100 ms 的 PCM16 单声道音频，分片间接收服务端事件。
   constexpr int chunkFrames = 1600;
+  int16_t chunk[chunkFrames];
   for (int offset = 0; offset < frames; offset += chunkFrames) {
     int count = min(chunkFrames, frames - offset);
-    if (!ws.sendPcm(pcm + offset, count)) { gAsrErr = ws.error; return ""; }
+    if (gAiCancel.load()) { gAsrErr = "CANCELLED"; return ""; }
+    const int16_t *samples = chunk;
+    if (wav) {
+      size_t bytes = count * sizeof(*samples);
+      if (wav->read((uint8_t *)chunk, bytes) != bytes) { gAsrErr = "WAV_READ"; return ""; }
+    } else {
+      samples = pcm + offset;
+    }
+    if (!ws.sendPcm(samples, count)) { gAsrErr = ws.error; return ""; }
     until = millis() + count / 16;
     while ((int32_t)(until - millis()) > 0) {
       if (!session.read(ws, 10)) return "";
@@ -492,6 +559,7 @@ static String asrTranscribe(const int16_t *pcm, int frames, const String &key) {
 
   until = millis() + 15000;
   while (!session.finished && (int32_t)(until - millis()) > 0) {
+    if (gAiCancel.load()) { gAsrErr = "CANCELLED"; return ""; }
     if (!session.read(ws, 250)) return "";
   }
   ws.close();
@@ -504,44 +572,15 @@ static String asrTranscribe(const int16_t *pcm, int frames, const String &key) {
 }
 
 // ---------------- Qwen 通用 HTTP 调用 ----------------
-// 拆 HTTP/1.1 chunked 包体：每块是"十六进制长度\r\n数据\r\n"，长度 0 收尾。
-// DashScope 的 OpenAI 兼容接口回 chunked，不拆就直接 deserializeJson 必失败，且报错很难看懂。
-static String httpDechunk(const String &in) {
-  String o;
-  o.reserve(in.length());
-  int i = 0, n = in.length();
-  while (i < n) {
-    int eol = in.indexOf("\r\n", i);
-    if (eol < 0) break;
-    long len = strtol(in.substring(i, eol).c_str(), nullptr, 16);
-    if (len <= 0) break;                     // 0 = 结束块（后面可能有 trailer，不管）
-    int s = eol + 2;
-    int e = s + (int)len;
-    if (e > n) e = n;
-    o.concat(in.substring(s, e));
-    i = e + 2;                               // 跳过块尾 \r\n
-  }
-  return o;
-}
-
 static String qwenCall(const char *systemPrompt, const char *userPrompt, const String &key,
                        const String &model, String &error, int maxTok = 512) {
   String out;
+  if (gAiCancel.load()) { error = "CANCELLED"; return out; }
   if (!key.length()) { error = "NO_KEY"; return out; }
   if (WiFi.status() != WL_CONNECTED) { error = "NO_WIFI"; return out; }
   WiFiClientSecure c;
   cloudUseCaBundle(c);
   c.setHandshakeTimeout(12);
-  uint32_t h0 = millis();
-  if (!c.connect("dashscope.aliyuncs.com", 443, 6000)) {
-    char detail[96] = {};
-    c.lastError(detail, sizeof(detail));
-    Serial.printf("[Qwen] tcp/tls connect failed (%lums, free=%u): %s\n",
-                  (unsigned long)(millis() - h0), (unsigned)ESP.getFreeHeap(), detail);
-    error = "CONNECT";
-    return out;
-  }
-  Serial.printf("[Qwen] connected in %lums\n", (unsigned long)(millis() - h0));
   StaticJsonDocument<2048> doc;
   doc["model"] = model.c_str();
   doc["temperature"] = 0.2;
@@ -551,37 +590,31 @@ static String qwenCall(const char *systemPrompt, const char *userPrompt, const S
   doc["messages"][1]["role"] = "user";
   doc["messages"][1]["content"] = userPrompt;
   String body; serializeJson(doc, body);
-  String req = "POST /compatible-mode/v1/chat/completions HTTP/1.1\r\n"
-             + String("Host: dashscope.aliyuncs.com\r\n")
-             + "Authorization: Bearer " + key + "\r\n"
-             + "Content-Type: application/json\r\n"
-             + "Content-Length: " + body.length() + "\r\n"
-             + "Connection: close\r\n\r\n" + body;
-  if (c.print(req) != req.length()) { error = "WRITE"; return out; }
-  unsigned long t0 = millis();
-  String resp;
-  resp.reserve(8192);
-  while (millis() - t0 < 25000 && c.connected()) {
-    while (c.available()) resp += (char)c.read();
-    delay(10);
+  HTTPClient http;
+  if (!http.begin(c, "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")) {
+    error = "CONNECT";
+    return out;
   }
-  while (c.available()) resp += (char)c.read();   // 连接已断但缓冲里还有尾巴
-  c.stop();
-  int p = resp.indexOf("\r\n\r\n");
-  if (p < 0) {                       // 连上了但一个字节都没回来（TLS 后断 / 超时）
-    Serial.printf("[Qwen] no response (%u bytes)\n", (unsigned)resp.length());
+  http.setConnectTimeout(6000);
+  http.setTimeout(15000);
+  http.addHeader("Authorization", "Bearer " + key);
+  http.addHeader("Content-Type", "application/json");
+  const int status = http.POST(body);
+  BoundedHttpBody reply(12288, &gAiCancel);
+  const bool received = status > 0 && reply.receive(http);
+  http.end();
+  if (gAiCancel.load()) { error = "CANCELLED"; return out; }
+  if (status <= 0) {
+    char detail[96] = {};
+    c.lastError(detail, sizeof(detail));
+    Serial.printf("[Qwen] HTTP transport=%d %s\n", status, detail);
     error = "RESPONSE";
     return out;
   }
-  String head = resp.substring(0, p);
-  String body0 = resp.substring(p + 4);
-  // DashScope 兼容接口默认 chunked（没有 Content-Length）——不拆包 JSON 必解析失败
-  if (head.indexOf("chunked") >= 0) body0 = httpDechunk(body0);
-  StaticJsonDocument<8192> jd;
-  DeserializationError err = deserializeJson(jd, body0);
-  if (err) {
-    Serial.printf("[Qwen] json err=%s status=%.24s\n", err.c_str(), head.c_str());
-    error = "JSON";
+  if (!received) { error = "RESPONSE_SIZE_OR_READ"; return out; }
+  JsonDocument jd;
+  if (deserializeJson(jd, static_cast<const String &>(reply))) {
+    error = status == 200 ? String("JSON") : String("HTTP_") + status;
     return out;
   }
   const char *apiErr = jd["error"]["message"] | (const char *)nullptr;
@@ -590,6 +623,7 @@ static String qwenCall(const char *systemPrompt, const char *userPrompt, const S
     Serial.printf("[Qwen] api error %s: %.160s\n", error.c_str(), apiErr);
     return out;
   }
+  if (status != 200) { error = String("HTTP_") + status; return out; }
   out = jd["choices"][0]["message"]["content"].as<String>();
   out.trim();
   out.replace("\r", "");
@@ -643,7 +677,8 @@ static String gAiResult;                     // 最终答复 / 纪要 / 添加�
 static uint32_t gAiRecStartMs = 0;           // 本段录音起始时刻
 static uint32_t gAiRecLimitMs = 20000;       // 一段录音的时长上限（录音机 60s，其余 20s）
 static bool     gAiRecToFile  = false;       // 本段是"录音机"（停=存卡，不转写）
-static void recToggleRecord();               // recorder.h 里的录音机按键（时长到顶时用它收尾）
+static void recToggleRecord(uint32_t limitMs = MIC_MAX_SAMPLES / 16);               // recorder.h 里的录音机按键（时长到顶时用它收尾）
+static bool recOpenPcm(const char *path, File &wav, int &frames);
 static void recStopPlay();                   // 录音前先停回放（同一组 I2S0，边放边录就是啸叫）
 static int gAiPeak = 0, gAiRms = 0;          // 录音电平（主循环刷新，UI 画条）
 // 结果归属：问答 / 备忘 / 会议各看各的，切页不串台
@@ -661,6 +696,7 @@ struct AiVoiceJob {
   String key;
   String model;
   String transcript;
+  String recording;
   String result;
   String error;
 };
@@ -669,26 +705,49 @@ struct AiVoiceJob {
 static std::atomic<AiVoiceJob *> gVoicePending{nullptr};
 static std::atomic<AiVoiceJob *> gVoiceComplete{nullptr};
 
-static bool aiQueueVoice(AiVoiceMode mode, int frames, int16_t *pcm, const String &text = "") {
-  AiVoiceJob *job = new (std::nothrow) AiVoiceJob{mode, frames, pcm, gBailianKey, gQwenModel, text, "", ""};
+static bool gVoiceWorkerReady = false;
+
+static bool aiQueueVoice(AiVoiceMode mode, int frames, int16_t *pcm, const String &text = "",
+                         const char *recording = "") {
+  if (!gVoiceWorkerReady) { free(pcm); return false; }
+  AiVoiceJob *job = new (std::nothrow) AiVoiceJob{mode, frames, pcm, gBailianKey, gQwenModel,
+                                                 text, recording, "", ""};
   if (!job) {
     free(pcm);
     return false;
   }
   gAiMode = mode;
   gAiState = AVS_PROCESSING;
+  gAiCancel.store(false);
   gVoicePending.store(job);
   return true;
 }
 
 static void aiVoiceRun(AiVoiceJob &job) {
-  if (job.pcm) {
-    job.transcript = asrTranscribe(job.pcm, job.frames, job.key);
+  if (gAiCancel.load()) {
     free(job.pcm);
     job.pcm = nullptr;
+    return;
+  }
+  if (job.pcm || job.recording.length()) {
+    if (job.pcm) {
+      job.transcript = asrTranscribe(job.pcm, job.frames, job.key, nullptr);
+      free(job.pcm);
+      job.pcm = nullptr;
+    } else {
+      TfTransfer transfer;
+      File wav;
+      if (!transfer || !recOpenPcm(job.recording.c_str(), wav, job.frames)) {
+        job.error = "录音读取失败";
+        return;
+      }
+      job.transcript = asrTranscribe(nullptr, job.frames, job.key, &wav);
+    }
     if (!job.transcript.length()) {
       Serial.printf("[ASR] failed: %s\n", gAsrErr.c_str());
-      if (gAsrErr.indexOf("NO_VALID_AUDIO") >= 0)
+      if (gAsrErr == "WAV_READ")
+        job.error = "录音读取失败";
+      else if (gAsrErr.indexOf("NO_VALID_AUDIO") >= 0)
         job.error = "没听清，靠近点再说一次";
       else if (gAsrErr == "NO_KEY" || gAsrErr == "WS_HTTP_401" || gAsrErr == "WS_HTTP_403")
         job.error = "请检查百炼 Key";
@@ -709,17 +768,23 @@ static void aiVoiceRun(AiVoiceJob &job) {
 }
 
 // netTask 复用开机分配的栈和 TLS 内存。
-static void cloudPollJobs() {
+static bool cloudPollJobs() {
+  xzPollBinding();
+  auto binding = gXzState.load();
+  if ((binding == XzBinding::Fetching || binding == XzBinding::Waiting) && !gAiCancel.load())
+    return true;
   if (AiVoiceJob *job = gVoicePending.exchange(nullptr)) {
     aiVoiceRun(*job);
     gVoiceComplete.store(job);
+    return true;
   }
-  xzPollBinding();
+  return false;
 }
 
 static void cloudApplyJobs() {
   AiVoiceJob *job = gVoiceComplete.exchange(nullptr);
   if (!job) return;
+  if (gAiCancel.exchange(false)) job->error = "已取消";
   const bool textChat = !job->frames && job->mode == AVM_CHAT;
   gAiResultOwner = job->mode;
   if (textChat) {
@@ -733,7 +798,12 @@ static void cloudApplyJobs() {
       if (!job->error.length()) {
         gTodoNewFrom = gTodoN;
         gMemoLastAdded = todoAddLines(job->result, 8);
-        job->result = gMemoLastAdded ? ("已加入 " + String(gMemoLastAdded) + " 条待办") : "没有新的待办";
+        if (gMemoLastAdded < 0) {
+          gMemoLastAdded = 0;
+          job->error = "待办保存失败";
+        } else {
+          job->result = gMemoLastAdded ? ("已加入 " + String(gMemoLastAdded) + " 条待办") : "没有新的待办";
+        }
       }
       if (!job->frames) Serial.printf("[AI] ASRTODO added %d todos (total %d)\n", gMemoLastAdded, gTodoN);
     }
@@ -745,19 +815,22 @@ static void cloudApplyJobs() {
 
 // 点录音键：开始录音（第一次）/ 停止并启动后台处理（第二次）
 static void aiVoiceToggle(AiVoiceMode mode) {
-  if (gAiState == AVS_PROCESSING) return;
+  if (gAiState == AVS_PROCESSING) {
+    if (gAiMode == mode) gAiCancel.store(true);
+    return;
+  }
   if (gAiState == AVS_RECORDING) {
     if (gAiRecToFile || gAiMode != mode) return;
     micStop();
     int frames = gMicN.load();
     gAiResultOwner = mode;
     if (frames < 1600) {
+      micReleaseBuffer();
       gAiResult = frames ? "录音太短" : "麦克风无采样";
       gAiState = AVS_ERROR;
       return;
     }
-    int16_t *pcm = (int16_t *)ps_malloc(frames * sizeof(int16_t));
-    if (pcm) memcpy(pcm, gMicBuf, frames * sizeof(int16_t));
+    int16_t *pcm = micTakeBuffer();
     if (!pcm || !aiQueueVoice(mode, frames, pcm)) {
       gAiResult = "内存不足";
       gAiState = AVS_ERROR;
@@ -772,7 +845,8 @@ static void aiVoiceToggle(AiVoiceMode mode) {
   gAiRecToFile = false;
   gAiRecLimitMs = 20000;
   recStopPlay();
-  if (!micBegin()) {
+  if (!micBegin(30, 16000 * 20)) {
+    micReleaseBuffer();
     gAiResult = "麦克风初始化失败";
     gAiState = AVS_ERROR;
     return;
@@ -830,7 +904,7 @@ static void cloudCmd(const String &cmd) {
     // TODOADD <文字> [@+3]  —— 尾部 @+N 表示 N 天后，@YYYY-MM-DD 表示具体日期
     String body = cmd.substring(8);
     uint32_t dl = todoStripInlineDeadline(body);
-    todoAdd(body.c_str(), dl); render();
+    todoAppend(body.c_str(), dl); todoCommit(); render();
     Serial.printf("[TODO] add '%s' deadline=%lu\n", body.c_str(), (unsigned long)dl);
   } else if (up.startsWith("TODOSET ")) {
     // TODOSET <序号从1起> <+3|2026-11-20 15:00|0清除>
@@ -841,12 +915,12 @@ static void cloudCmd(const String &cmd) {
       String ds = args.substring(sp + 1);
       if (idx >= 0 && idx < gTodoN) {
         gTodos[idx].deadline = ds == "0" ? 0 : todoParseDeadline(ds);
-        todoSave(); render();
+        todoCommit(); render();
         Serial.printf("[TODO] #%d deadline=%lu\n", idx + 1, (unsigned long)gTodos[idx].deadline);
       } else Serial.println("[TODO] bad index");
     } else Serial.println("[TODO] usage: TODOSET <n> <+3|YYYY-MM-DD HH:MM|0>");
   } else if (up == "TODOCLEAR") {
-    gTodoN = 0; todoSave(); render();
+    gTodoN = 0; todoCommit(); render();
   } else if (up.startsWith("NETTEST")) {
     // 网络分层诊断：DNS -> TCP -> TLS，哪一层断了一眼看出来
     String host = cmd.length() > 8 ? cmd.substring(8) : "dashscope.aliyuncs.com";
@@ -902,6 +976,8 @@ static void cloudCmd(const String &cmd) {
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                   (unsigned)ESP.getFreePsram(),
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+  } else if (up == "AICANCEL") {
+    if (gAiState == AVS_PROCESSING) gAiCancel.store(true);
   } else if (up == "AI") {
     // 语音状态机快照：验收用，无需真麦克风也能看链路状态
     static const char *ST[] = {"IDLE", "RECORDING", "PROCESSING", "DONE", "ERROR"};

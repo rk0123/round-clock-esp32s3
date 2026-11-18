@@ -8,6 +8,8 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <time.h>
+#include <sys/time.h>
+#include <esp_sntp.h>
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -284,14 +286,15 @@ static bool navigate(char dir) {
 static int gHour = 10, gMin = 28, gSec = 42;
 static int gDay = 14, gMon = 11, gYear = 2026, gWday = 6;
 static bool gClockSynced = false;
-static uint32_t lastSecMs = 0;
+static time_t lastClockEpoch = 0;
+static std::atomic<bool> gNtpUpdated{false};
 // v0.19：时间来源（BUILD 编译时刻 / RTC 板载时钟 / NTP 网络），STATUS 里可见
 static const char *gTimeSrc = "BUILD";
 // 开机那一刻实际用的是哪个源。USB-CDC 复位时开机日志常常抓不到（主机还没枚举完），
 // 所以单独留一个字段给 STATUS 读，随时能验证"断网开机到底准不准"。
 static char gBootTimeSrc[8] = "BUILD";
-// 软件时间比 RTC 新（刚对完 NTP 或刚手动设过），等触摸任务串行写回，避免跨任务抢 I2C
-static volatile bool gRtcDirty = false;
+// 对时后由主循环写回 RTC。
+static bool gRtcDirty = false;
 
 static int daysInMonth(int y, int m) {
   static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
@@ -306,40 +309,42 @@ static int weekdayOf(int y, int m, int d) {
   return (yy + yy / 4 - yy / 100 + yy / 400 + t[m - 1] + d) % 7;
 }
 static void clockTick() {
-  uint32_t now = millis();
-  while (now - lastSecMs >= 1000) {
-    lastSecMs += 1000;
-    if (++gSec >= 60) {
-      gSec = 0;
-      if (++gMin >= 60) {
-        gMin = 0;
-        if (++gHour >= 24) {
-          gHour = 0; gDay++; gWday = (gWday + 1) % 7;
-          if (gDay > daysInMonth(gYear, gMon)) {
-            gDay = 1;
-            if (++gMon > 12) { gMon = 1; gYear++; }
-          }
-        }
-      }
-    }
-  }
+  time_t now = time(nullptr);
+  if (now == lastClockEpoch) return;
+  struct tm local;
+  if (!localtime_r(&now, &local) || local.tm_year + 1900 < 2024) return;
+  lastClockEpoch = now;
+  const int year = local.tm_year + 1900, month = local.tm_mon + 1;
+  if (gYear != year || gMon != month || gDay != local.tm_mday) gWday = local.tm_wday;
+  gYear = year; gMon = month; gDay = local.tm_mday;
+  gHour = local.tm_hour; gMin = local.tm_min; gSec = local.tm_sec;
 }
-// 返回 true 表示拿到可信时间。注意 getLocalTime 在"NTP 还没回包"时也会返回
-// 1970-01-01（RTC 未设置），必须按年份判掉，否则会显示 1970 还误报已对时。
-static bool syncClockFromSNTP() {
-  struct tm ti;
-  if (!getLocalTime(&ti, 300)) return false;
-  if (ti.tm_year + 1900 < 2024) return false;        // 尚未同步到真实时间
-  gHour = ti.tm_hour; gMin = ti.tm_min; gSec = ti.tm_sec;
-  gDay = ti.tm_mday; gMon = ti.tm_mon + 1; gYear = ti.tm_year + 1900;
-  gWday = ti.tm_wday;
+
+static void clockSetSystem() {
+  struct tm local = {};
+  local.tm_year = gYear - 1900;
+  local.tm_mon = gMon - 1;
+  local.tm_mday = gDay;
+  local.tm_hour = gHour;
+  local.tm_min = gMin;
+  local.tm_sec = gSec;
+  local.tm_isdst = -1;
+  const struct timeval timestamp = {mktime(&local), 0};
+  settimeofday(&timestamp, nullptr);
+  lastClockEpoch = 0;
+}
+
+static void onNtpSync(struct timeval *) { gNtpUpdated.store(true); }
+
+static void clockApplyNtp() {
+  if (!gNtpUpdated.exchange(false)) return;
+  clockTick();
+  gWday = weekdayOf(gYear, gMon, gDay);
   gClockSynced = true;
   gTimeSrc = "NTP";
-  gRtcDirty = true;          // 对完时写回板载 RTC，下次断网开机也能直接准
-  lastSecMs = millis();
+  gRtcDirty = true;
   Serial.printf("[TIME] SNTP -> %04d-%02d-%02d %02d:%02d:%02d wday=%d\n",
                 gYear, gMon, gDay, gHour, gMin, gSec, gWday);
-  return true;
 }
 static const char *WDAY_EN[] = {"SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"};
 // 模拟表盘左侧星期窗：中文数字，0=周日，与 tm_wday 一致
@@ -397,7 +402,6 @@ static bool restoreClockFromNvs() {
   if (v <= cur) return false;              // 比编译时刻还旧就没意义
   gYear = y; gMon = mo; gDay = d; gHour = h; gMin = mi; gSec = 0;
   gWday = weekdayOf(y, mo, d);
-  lastSecMs = millis();
   gTimeSrc = "NVS";
   snprintf(gBootTimeSrc, sizeof(gBootTimeSrc), "NVS");
   Serial.printf("[TIME] restored last known time from NVS: %04d-%02d-%02d %02d:%02d\n",
@@ -490,7 +494,6 @@ static bool rtcBegin() {
   }
   gSec = s; gMin = mi; gHour = h; gDay = d; gMon = mo; gYear = y;
   gWday = weekdayOf(y, mo, d);
-  lastSecMs = millis();
   gClockSynced = true;
   gTimeSrc = "RTC";
   gRtcValid = true;
@@ -500,7 +503,7 @@ static bool rtcBegin() {
   return true;
 }
 
-// 把当前软件时间写进 RTC（0x04..0x0A 七个 BCD 字节）。只在触摸任务里调用，避免抢 I2C。
+// 主循环把当前时间写进 RTC（0x04..0x0A 七个 BCD 字节）。
 static bool rtcWriteClock() {
   if (!gRtcFound) return false;
   uint8_t b[7];
@@ -553,13 +556,14 @@ static void rtcService() {
     if (diff < -12 * 3600) diff += 24 * 3600;
     if (diff >= 2 || diff <= -2) {       // 软时钟跑快了/慢了，按 RTC 兜回来
       gHour = h; gMin = mi; gSec = s;
-      lastSecMs = millis();
+      clockSetSystem();
       gTimeSrc = "RTC";
       Serial.printf("[RTC] soft clock drift %+ds -> corrected from RTC\n", diff);
     }
   } else if (gYear != y || gMon != mo || gDay != d) {
     gYear = y; gMon = mo; gDay = d; gWday = weekdayOf(y, mo, d);
-    gHour = h; gMin = mi; gSec = s; lastSecMs = millis();
+    gHour = h; gMin = mi; gSec = s;
+    clockSetSystem();
     gTimeSrc = "RTC";
     Serial.printf("[RTC] date mismatch -> resync %04d-%02d-%02d %02d:%02d:%02d\n",
                   gYear, gMon, gDay, gHour, gMin, gSec);
@@ -737,9 +741,9 @@ static void parseAdsb(const char *json) {
 }
 
 // ---------------------------------------------------------------- 网络任务（Core 0）
-bool wifiOK = false;                  // 非 static：audio_player.h 里 extern 复用
-static volatile bool netBusy = false;
-static uint32_t lastWx = 0, lastAdsb = 0;
+std::atomic<bool> wifiOK{false};                  // 非 static：audio_player.h 里 extern 复用
+static std::atomic<bool> netBusy{false};
+static std::atomic<uint32_t> lastWx{0}, lastAdsb{0};
 // v0.21：Wi-Fi 断开原因快照。core 3.0.7 的 WiFiClass 只提供「给定 reason 码 → 名字」的
 // disconnectReasonName()，取不到当前原因，只能自己挂事件回调把最后一次 reason 记下来。
 // 排障时这一项直接区分「扫不到 SSID(201)」和「密码错(15/204)」——之前只能看个 OFFLINE 干瞪眼。
@@ -780,23 +784,24 @@ static void mapWmo(int c, Weather &w) {
 }
 
 // 主源：彩云天气 v2.6（需要用户自己的 token；官方 demo token 实测 429）
-static bool fetchCaiyun() {
+static bool fetchCaiyun(const String &token) {
   WiFiClientSecure cli;
-  cli.setInsecure();
+  cloudUseCaBundle(cli);
   cli.setHandshakeTimeout(8);   // TLS 握手最多 8s，避免网络异常时把网络任务永久锁死
   HTTPClient http;
   http.setConnectTimeout(6000);
   char url[220];
   snprintf(url, sizeof(url),
            "https://api.caiyunapp.com/v2.6/%s/%.5f,%.5f/weather?dailysteps=1&hourlysteps=1",
-           gCfg.token.c_str(), gHomeLon, gHomeLat);
+           token.c_str(), gHomeLon, gHomeLat);
   if (!http.begin(cli, url)) { Serial.println("[WX] caiyun begin failed"); return false; }
   http.setTimeout(ADSB_HTTP_TIMEOUT_MS);
   http.addHeader("User-Agent", "esp32-round-clock/1.0");
   int code = http.GET();
   bool ok = false;
   if (code == 200) {
-    String body = http.getString();
+    BoundedHttpBody body(32768);
+    if (!body.receive(http)) { http.end(); return false; }
     const char *s = body.c_str();
     char sky[32] = {0};
     float t = jNum(s, "temperature", 16, 6000);
@@ -822,7 +827,7 @@ static bool fetchCaiyun() {
 // 兜底源：Open-Meteo，免密钥、实测约 500B / 1.9s。没 token 也能显示真实天气。
 static bool fetchOpenMeteo() {
   WiFiClientSecure cli;
-  cli.setInsecure();
+  cloudUseCaBundle(cli);
   cli.setHandshakeTimeout(8);   // TLS 握手最多 8s，避免网络异常时把网络任务永久锁死
   HTTPClient http;
   http.setConnectTimeout(6000);
@@ -838,7 +843,8 @@ static bool fetchOpenMeteo() {
   int code = http.GET();
   bool ok = false;
   if (code == 200) {
-    String body = http.getString();
+    BoundedHttpBody body(32768);
+    if (!body.receive(http)) { http.end(); return false; }
     const char *s = body.c_str();
     const char *cur   = strstr(s, "\"current\"");
     const char *daily = strstr(s, "\"daily\"");
@@ -883,7 +889,7 @@ static void mapMetSymbol(const char *sym, Weather &w) {
 
 static bool fetchMetNo() {
   WiFiClientSecure cli;
-  cli.setInsecure();
+  cloudUseCaBundle(cli);
   cli.setHandshakeTimeout(8);
   HTTPClient http;
   http.setConnectTimeout(6000);
@@ -901,8 +907,10 @@ static bool fetchMetNo() {
     http.end();
     return false;
   }
-  String body = http.getString();
+  BoundedHttpBody body(65536);
+  const bool received = body.receive(http);
   http.end();
+  if (!received) return false;
   const char *s = body.c_str();
   const char *ts = strstr(s, "\"timeseries\"");
   if (!ts) { Serial.println("[WX] met.no parse: no timeseries"); return false; }
@@ -952,7 +960,12 @@ static bool fetchMetNo() {
 static void fetchWeather() {
   if (!wifiOK) { wx.live = false; strcpy(wxSrc, "DEMO"); return; }
   bool ok = false;
-  if (gCfg.token.length() > 0) ok = fetchCaiyun();
+  String token;
+  {
+    Preferences prefs;
+    if (prefs.begin("rcfg", true)) token = prefs.getString("token", CAIYUN_TOKEN);
+  }
+  if (token.length()) ok = fetchCaiyun(token);
   if (!ok) ok = fetchOpenMeteo();
   if (!ok) ok = fetchMetNo();          // open-meteo 在部分网络整段不通，靠这条兜底
   if (!ok) { wx.live = false; strcpy(wxSrc, "DEMO"); }  // 保留上次数值，界面不空白
@@ -960,7 +973,7 @@ static void fetchWeather() {
 
 static void fetchAdsb() {
   WiFiClientSecure cli;
-  cli.setInsecure();
+  cloudUseCaBundle(cli);
   cli.setHandshakeTimeout(8);   // TLS 握手最多 8s，避免网络异常时把网络任务永久锁死
   HTTPClient http;
   http.setConnectTimeout(6000);
@@ -1004,106 +1017,80 @@ static void fetchAdsb() {
   http.end();
 }
 
-#define NET_WIFI_WAIT_MS   30000UL    // 首连最多等 30s（旧版只等 10s，DHCP 慢就直接永久 OFFLINE）
 #define NET_WIFI_RETRY_MS  30000UL    // 一直连不上时，每隔多久主动重连（原 15s 会打断进行中的握手）
 #define NET_RETRY_ADSB_MS  20000UL    // 航班没拿到数据时的重试间隔
 #define NET_RETRY_WX_MS    15000UL    // 天气没拿到数据时的重试间隔
-// v0.19：时间不再依赖网络 —— 板载 PCF85063 负责走时，NTP 只是"每几小时校准一次"。
-// 联网时每 3 h 对一次并写回 RTC；断网时由 RTC 兜底，每 10 min 反向校正软时钟漂移。
-#define NET_NTP_REFRESH_MS (3UL * 60UL * 60UL * 1000UL)
 
+// Wi-Fi 连线控制由主循环推进，语音/HTTPS 阻塞时仍可检测断线并重连。
+static void netPollConnection() {
+  static uint32_t lastPoll = 0;
+  static uint32_t lastRetry = 0;
+  static uint32_t resumeAt = 0;
+  static int retry = 0;
+  static uint8_t reconnectPhase = 0;
+  const uint32_t now = millis();
+  if (now - lastPoll < 100) return;
+  lastPoll = now;
+
+  const bool connected = WiFi.status() == WL_CONNECTED;
+  if (wifiOK.exchange(connected) != connected) {
+    Serial.printf("[NET] wifi %s%s\n", connected ? "UP " : "DOWN",
+                  connected ? WiFi.localIP().toString().c_str() : "");
+    if (connected) {
+      configTzTime("CST-8", "ntp.aliyun.com", "pool.ntp.org", "time.windows.com");
+      lastWx.store(0);
+      lastAdsb.store(0);
+      retry = 0;
+    } else {
+      lastRetry = now;
+    }
+  }
+  if (connected || gProvActive || gNetHold || curPage == P_WIFI || !gCfg.ssid.length()) {
+    reconnectPhase = 0;
+    return;
+  }
+
+  if (!reconnectPhase) {
+    if (now - lastRetry < NET_WIFI_RETRY_MS) return;
+    lastRetry = now;
+    Serial.printf("[NET] wifi retry #%d reason=%u %s\n", ++retry, (unsigned)gWifiLastReason,
+                  WiFi.disconnectReasonName((wifi_err_reason_t)gWifiLastReason));
+    WiFi.disconnect(true, false);
+    resumeAt = now + 200;
+    reconnectPhase = 1;
+  } else if ((int32_t)(now - resumeAt) >= 0) {
+    if (reconnectPhase == 1) {
+      WiFi.mode(WIFI_STA);
+      resumeAt = now + 100;
+      reconnectPhase = 2;
+    } else {
+      WiFi.setSleep(false);
+      WiFi.begin(gCfg.ssid.c_str(), gCfg.pass.c_str());
+      reconnectPhase = 0;
+    }
+  }
+}
+
+// 串行执行固件自己的 HTTPS 和语音请求，避免同时申请两份 TLS 缓冲。
 static void netTask(void *) {
-  // 配网 AP 模式下没有 STA 连接，轮询任务直接退出（用户保存后会重启进 STA）
-  if (gProvActive) { Serial.println("[NET] AP provisioning mode, polling task idle"); vTaskDelete(nullptr); return; }
-
-  // 等 Wi-Fi。之前只等 10s 就定死 wifiOK，一旦 DHCP 慢 / AP 隐藏 SSID 重连慢，
-  // 整机就永久停在 OFFLINE：不对时、不拉天气、不拉航班、音频也报 no WiFi。
-  for (uint32_t t0 = millis(); millis() - t0 < NET_WIFI_WAIT_MS; ) {
-    if (WiFi.status() == WL_CONNECTED) break;
-    delay(250);
-  }
-  wifiOK = (WiFi.status() == WL_CONNECTED);
-  Serial.printf("[NET] wifi=%s ip=%s\n", wifiOK ? "OK" : "OFFLINE", WiFi.localIP().toString().c_str());
-
-  bool clkSynced = false;
-  uint32_t lastNtp = 0;
-  uint32_t lastWifiRetry = 0;
-  int  wifiRetry = 0;
-  bool firstRound = true;
-
-  if (wifiOK) {
-    configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org", "time.windows.com");
-    // SNTP 要一次真实往返（DNS + UDP，实测常 1~3s）。旧版 configTime 后只 delay(1200)
-    // 再单次 getLocalTime(200ms)，首次几乎必定失败，时钟就一直走软时钟 —— 这就是
-    // 用户看到的"联网了但没自动对时"。这里改成重试到成功为止。
-    for (int i = 0; i < 30 && !clkSynced; i++) {
-      if (syncClockFromSNTP()) clkSynced = true;
-      else delay(400);
-    }
-    if (!clkSynced) Serial.println("[TIME] SNTP not ready yet, will retry in loop");
-    delay(600);                 // 让 DNS / TLS 栈彻底就绪，首包不至于 -11
-  } else {
-    // v0.16：没有 Wi-Fi 就显示 NO SIGNAL 空雷达，不再预填演示飞机
-    clearPlanes();
-  }
-
+  bool preferWeather = false;
   for (;;) {
-    uint32_t now = millis();
-
-    // 云端队列（问答 / 语音转写+纪要）在这里执行：netTask 的 16KB 栈开机就分配好，
-    // 不用每次再挖新栈，TLS 握手才有足够内部 RAM。
-    cloudPollJobs();
-
-    // Wi-Fi 状态动态跟踪：断线后又连上（或开机时慢于首次等待）都要能自愈
-    bool conn = (WiFi.status() == WL_CONNECTED);
-    if (conn != wifiOK) {
-      wifiOK = conn;
-      Serial.printf("[NET] wifi %s%s\n", conn ? "UP " : "DOWN",
-                    conn ? WiFi.localIP().toString().c_str() : "");
-      if (conn) { configTime(8 * 3600, 0, "ntp.aliyun.com", "pool.ntp.org", "time.windows.com"); }
-    }
-
-    // 一直连不上就主动重连。esp_wifi 在「一次都没连成功过」的情况下会把重试次数用完后
-    // 彻底放弃，而 setAutoReconnect 只管「曾经连上后掉线」。不自己重新 begin 的话，
-    // 换路由器 / 开机时 AP 还没起来 / 之前连的是 5G 频段，都会永久停在 OFFLINE。
-    if (!conn && gCfg.ssid.length() && !gNetHold) {
-      if (now - lastWifiRetry >= NET_WIFI_RETRY_MS) {
-        lastWifiRetry = now;
-        wifiRetry++;
-        Serial.printf("[NET] wifi retry #%d begin '%s' (status=%d lastReason=%u %s x%lu)\n",
-                      wifiRetry, gCfg.ssid.c_str(), (int)WiFi.status(),
-                      (unsigned)gWifiLastReason,
-                      WiFi.disconnectReasonName((wifi_err_reason_t)gWifiLastReason),
-                      (unsigned long)gWifiDiscCount);
-        // v0.21：以前这里是 disconnect(false,false) 紧跟 begin()，间隔 15s。
-        // 实测日志会甩一行 "E wifi:sta is connecting, return error" —— 上一次握手
-        // 还没结束就又被强行 begin，等于自己把 4-way handshake 打断，永远停在 204。
-        // 现在改成「彻底重置 STA」：关射频 → 重开 → begin，并留出退避时间。
-        WiFi.disconnect(true, false);
-        delay(200);
-        WiFi.mode(WIFI_STA);
-        delay(100);
-        WiFi.begin(gCfg.ssid.c_str(), gCfg.pass.c_str());
+    if (!cloudPollJobs() && wifiOK.load() && !netBusy.load()) {
+      const uint32_t now = millis();
+      const uint32_t wxAt = lastWx.load(), adsbAt = lastAdsb.load();
+      const bool wxDue = !wxAt || now - wxAt >= (wx.live ? WX_REFRESH_MS : NET_RETRY_WX_MS);
+      const bool adsbDue = !adsbAt || now - adsbAt >= (lastLiveCount ? ADSB_REFRESH_MS : NET_RETRY_ADSB_MS);
+      if (wxDue && (!adsbDue || preferWeather)) {
+        lastWx.store(now);
+        fetchWeather();
+        preferWeather = false;
+      } else if (adsbDue) {
+        lastAdsb.store(now);
+        fetchAdsb();
+        preferWeather = true;
       }
     }
-
-    if (wifiOK && !netBusy) {
-      // 时钟：未对上就抓紧对；已对上则每 30 min 校一次，抵消 millis() 软走时漂移
-      if (!clkSynced) {
-        if (syncClockFromSNTP()) { clkSynced = true; lastNtp = now; }
-      } else if (now - lastNtp >= NET_NTP_REFRESH_MS) {
-        lastNtp = now;
-        syncClockFromSNTP();
-      }
-
-      // 没拿到真实数据时用短间隔重试，别等满 30 min / 60 s
-      uint32_t adThr = (lastLiveCount > 0) ? ADSB_REFRESH_MS : NET_RETRY_ADSB_MS;
-      uint32_t wxThr = wx.live ? WX_REFRESH_MS : NET_RETRY_WX_MS;
-      if (firstRound || now - lastAdsb >= adThr) { lastAdsb = now; fetchAdsb(); }
-      if (firstRound || now - lastWx >= wxThr)   { lastWx = now;   fetchWeather(); }
-      firstRound = false;
-    }
-    delay(1000);
+    delay(100);
   }
 }
 
@@ -2603,10 +2590,10 @@ static int drawWrapText(const char *s, int x, int y, int maxW, int lineH,
 }
 
 // 三个语音页共用的大圆键：IDLE「说话/录音」→ RECORDING「停止」→ PROCESSING「识别中」
-static void drawVoiceButton(int cx, int cy, int r, const char *idleLabel) {
-  bool rec = gAiState == AVS_RECORDING;
-  bool proc = gAiState == AVS_PROCESSING;
-  const char *lab = rec ? "停止" : proc ? "识别中" : idleLabel;
+static void drawVoiceButton(int cx, int cy, int r, const char *idleLabel, AiVoiceMode mode) {
+  bool rec = gAiState == AVS_RECORDING && !gAiRecToFile && gAiMode == mode;
+  bool proc = gAiState == AVS_PROCESSING && gAiMode == mode;
+  const char *lab = rec ? "停止" : proc ? (gAiCancel.load() ? "取消中" : "取消") : idleLabel;
   uiBtn(cx, cy, r, lab, rec ? UI_D : proc ? UI_N : UI_A, 24);
   if (rec) {
     // 电平条画在圆键**内部下方**（不放圆外）：录音机键已在 y=288，
@@ -2685,7 +2672,7 @@ static void renderChat() {
     drawText(180, 118, "点下方圆键说话", C_GREY, 16, 1, 1);
     drawText(180, 144, "问一句小智答一句", COL(100, 112, 130), 16, 1, 1);
   }
-  drawVoiceButton(180, 258, 46, "说话");
+  drawVoiceButton(180, 258, 46, "说话", AVM_CHAT);
   uiBtn(266, 258, 25, "绑定", UI_G);
 }
 
@@ -2718,7 +2705,7 @@ static void renderMemo() {
     drawText(180, 118, "说出要做的事", C_GREY, 16, 1, 1);
     drawText(180, 144, "自动记进待办清单", COL(100, 130, 115), 16, 1, 1);
   }
-  drawVoiceButton(138, 250, 44, "录音");
+  drawVoiceButton(138, 250, 44, "录音", AVM_MEMO);
   uiBtn(242, 250, 36, gMemoBackToTodo ? "返回" : "清单", UI_G);
 }
 
@@ -2803,14 +2790,14 @@ static void renderRecorder() {
 
   // ---- 当前选中这一段 ----
   if (gRecN > 0) {
-    char nm[24];
-    snprintf(nm, sizeof(nm), "%s", gRec[gRecSel].name);
+    char nm[64];
+    fitText(nm, sizeof(nm), gRec[gRecSel].name, 16, 258);
     drawText(180, 132, nm, C_WHITE, 16, 1, 1);
   } else {
     drawText(180, 132, "还没有录音", COL(150, 132, 112), 16, 1, 1);
   }
   // 段数 / 存储（数字与中文分段：FONT16 下中文 16px、ASCII 只有 10px，混排必撞）
-  if (gRecMsg[0] && millis() > gRecMsgUntil) gRecMsg[0] = 0;   // 提示 3 秒后让位
+  if (!gRecWrite && gRecMsg[0] && (int32_t)(millis() - gRecMsgUntil) >= 0) gRecMsg[0] = 0;   // 提示 3 秒后让位
   if (gRecMsg[0]) {
     drawText(180, 158, gRecMsg, COL(200, 176, 140), 16, 1, 1);
   } else if (gRecN > 0) {
@@ -2837,7 +2824,7 @@ static void renderRecorder() {
   uiBtn(112, 292, 24, play ? "停止" : "回放", play ? UI_D : UI_G);
   if (rec) uiBtn(180, 286, 34, "停止", UI_D, 24);
   else uiBtn(180, 286, 34, "录音", busy ? UI_N : UI_A, 24);
-  uiBtn(248, 292, 24, "纪要", UI_S);
+  uiBtn(248, 292, 24, busy ? "取消" : "纪要", UI_S);
 }
 
 static bool recListTap(int x, int y) {
@@ -2924,14 +2911,14 @@ static void renderTodo() {
 }
 
 // ---------------- 期限快捷选择（清单子页） ----------------
-static void todoSetQuickDeadline(int days) {
-  if (gTodoDeadlineFor < 0 || gTodoDeadlineFor >= gTodoN) return;
+static bool todoSetQuickDeadline(int days) {
+  if (gTodoDeadlineFor < 0 || gTodoDeadlineFor >= gTodoN) return false;
   time_t now = time(nullptr);
   struct tm t; localtime_r(&now, &t);
   t.tm_hour = 23; t.tm_min = 59; t.tm_sec = 0;
   gTodos[gTodoDeadlineFor].deadline =
     days < 0 ? 0 : (uint32_t)(mktime(&t) + (time_t)days * 86400L);
-  todoSave();
+  return todoCommit();
 }
 static void renderTodoDeadline() {
   uiPage("设置期限", COL(90, 150, 110));
@@ -3215,7 +3202,7 @@ bool cfgExtra(const String &raw) {
   }
   if (up.startsWith("BAILIAN") || up.startsWith("XZTOKEN") || up == "XZBIND" || up == "XZSTATUS"
       || up.startsWith("TODO")
-      || up == "AI" || up.startsWith("QWEN ") || up == "ASRTODO"
+      || up == "AI" || up == "AICANCEL" || up.startsWith("QWEN ") || up == "ASRTODO"
       || up.startsWith("NET") || up == "MEM" || up.startsWith("MODEL")) { cloudCmd(raw); return true; }
   if (up == "TFSCAN") { audioRescanTF(); Serial.println("[CFG] TF rescan queued"); return true; }
   if (up == "TFTEST") {
@@ -3338,10 +3325,10 @@ bool cfgExtra(const String &raw) {
     if (!ok) { Serial.println("[RTC] usage: SETTIME 2026-11-15 23:30[:00]"); return true; }
     gYear = Y; gMon = M; gDay = D; gHour = h; gMin = m; gSec = s;
     gWday = weekdayOf(Y, M, D);
-    lastSecMs = millis();
+    clockSetSystem();
     gClockSynced = true;
     gTimeSrc = "MANUAL";
-    gRtcDirty = true;                       // 交给触摸任务写回 RTC，掉电也能记住
+    gRtcDirty = true;                       // 主循环写回 RTC
     Serial.printf("[RTC] manual set -> %04d-%02d-%02d %02d:%02d:%02d (write to RTC queued)\n",
                   gYear, gMon, gDay, gHour, gMin, gSec);
     render();
@@ -3671,7 +3658,11 @@ static void handleTap(int x, int y) {
       if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
         recStopPlay(); curPage = P_APPS; render(); return;
       }
-      if (gAiState == AVS_PROCESSING) { showToast("纪要生成中"); break; }
+      if (gAiState == AVS_PROCESSING) {
+        if (gAiMode == AVM_MEETING && hit(x, y, 248, 292, 32)) gAiCancel.store(true);
+        else showToast("语音任务进行中");
+        break;
+      }
       if (hit(x, y, 180, 286, 42)) { recToggleRecord(); return; }
       if (hit(x, y, 112, 292, 32)) { recTogglePlay(); render(); return; }
       if (hit(x, y, 248, 292, 32)) { recMakeMinutes(); render(); return; }
@@ -3689,9 +3680,8 @@ static void handleTap(int x, int y) {
         static const int DD[5] = {0, 1, 7, 30, -1};
         for (int i = 0; i < 5; i++) {
           if (hit(x, y, DX[i], DY[i], 34)) {
-            todoSetQuickDeadline(DD[i]);
+            if (todoSetQuickDeadline(DD[i])) showToast(DD[i] < 0 ? "已清除期限" : "期限已设置");
             gTodoDeadlineFor = -1;
-            showToast(DD[i] < 0 ? "已清除期限" : "期限已设置");
             render(); return;
           }
         }
@@ -3710,8 +3700,10 @@ static void handleTap(int x, int y) {
         curPage = P_MEMO; render();
       } else if (hit(x, y, 252, 285, 38)) {            // 清空：3s 内二次确认
         if (gTodoN > 0 && millis() < gTodoClearArmUntil) {
-          gTodoN = 0; todoSave(); gTodoPage = 0; gTodoClearArmUntil = 0;
-          gMemoLastAdded = 0; gTodoNewFrom = -1; showToast("已清空");
+          gTodoN = 0;
+          if (todoCommit()) showToast("已清空");
+          gTodoPage = 0; gTodoClearArmUntil = 0;
+          gMemoLastAdded = 0; gTodoNewFrom = -1;
         } else if (gTodoN > 0) {
           gTodoClearArmUntil = millis() + 3000; showToast("再点一次确认清空");
         }
@@ -3828,7 +3820,6 @@ static void touchTask(void *) {
   for (;;) {
     // 电量计与触摸共用 Wire；放在同一任务里串行读，避免跨任务 I2C 事务互相打断
     batteryPoll();
-    rtcService();          // RTC 写回 / 断网漂移校正，同样串行在这条 I²C 上
     uint8_t pts = 0; uint16_t rx = 0, ry = 0;
     if (!Touch_PollRaw(&pts, &rx, &ry)) {   // 读失败：跳过本帧，别把总线抖动当成抬手
       vTaskDelay(pdMS_TO_TICKS(10));
@@ -3980,7 +3971,11 @@ void setup() {
                 batteryStateText());
   // v0.19：板载 PCF85063 RTC —— 有电池时断网开机时间也是准的，盖掉"编译时刻"兜底。
   // RTC 读不出可信时间（没装备用电池/从没设过）时，退回 NVS 里最后一次对好的时间。
+  setenv("TZ", "CST-8", 1);
+  tzset();
   if (!rtcBegin()) restoreClockFromNvs();
+  clockSetSystem();
+  sntp_set_time_sync_notification_cb(onNtpSync);
   Serial.printf("[TIME] boot time source = %s\n", gBootTimeSrc);
   Backlight_Init();
   // 亮度 / 音量从 NVS 读回（设置页里改过的话掉电保留）
@@ -4015,7 +4010,6 @@ void setup() {
     gPomoFocusMin = POMO_FOCUS_MIN;
   pomo.remainMs = (uint32_t)gPomoFocusMin * 60000UL;
   pomo.lastMs = millis();
-  lastSecMs = millis();
 
   // 首帧立刻出画，不等 Wi-Fi
   render();
@@ -4040,8 +4034,8 @@ void setup() {
   // v0.14：网络任务必须在 Core1。ESP32-audioI2S 的解码任务(优先级2)和我们
   // 的喂流任务(优先级3)都钉在 Core0；原来 netTask 也挤在 Core0，天气/航班的
   // HTTPS 长请求抢 lwIP/TLS 共享锁，直播流 read() 被卡 -> InBuffer 抽空即静音。
-  if (xTaskCreatePinnedToCore(netTask, "net", 16384, nullptr, 1, nullptr, 1) != pdPASS)
-    Serial.println("[NET] task creation failed");
+  gVoiceWorkerReady = xTaskCreatePinnedToCore(netTask, "net", 16384, nullptr, 1, nullptr, 1) == pdPASS;
+  if (!gVoiceWorkerReady) Serial.println("[NET] task creation failed");
 }
 
 static uint32_t lastDraw = 0, lastFrame = 0;
@@ -4051,10 +4045,14 @@ void loop() {
   lastFrame = now;
 
   clockTick();
+  clockApplyNtp();
+  rtcService();
+  netPollConnection();
   pomoTick();
   pollButton();               // 右上实体 BOOT 键：按一下 息屏 / 亮屏
   pollTouch();
   cloudApplyJobs();           // 语音结果、待办存盘都由主循环处理
+  recPollSave();              // 每轮写一块，触摸和渲染可以继续
   aiVoicePoll();              // 录音中：刷新电平条 + 20s 上限自动停
   // 闭环：从待办页"语音加"进备忘，识别写入完成后自动回清单（录完即见成果）
   if (gMemoBackToTodo && curPage == P_MEMO && gAiResultOwner == AVM_MEMO
@@ -4091,10 +4089,21 @@ void loop() {
     // v0.16：真实航班不插值，扫描线动画仍在 renderRadar() 里按 millis() 走
   }
 
+  if (gLocked) { delay(gRecWrite ? 1 : 15); return; }
+  static bool lastSettingsWifi = false;
+  const bool staticPage = curPage == P_APPS || curPage == P_SETTINGS;
+  if (staticPage) {
+    const bool expired = gToast[0] && (int32_t)(now - gToastUntil) >= 0;
+    if (expired) gToast[0] = 0;
+    const bool wifiChanged = curPage == P_SETTINGS && lastSettingsWifi != wifiOK.load();
+    lastSettingsWifi = wifiOK.load();
+    if (expired || wifiChanged) render();
+    delay(1);
+    return;
+  }
+
   uint32_t interval = 250;                                   // 表盘 4 fps 足够
-  if (gLocked)                interval = 1000;              // 锁屏 1fps 刷新时间即可
-  else if (curPage == P_WIFI) interval = 120;               // 配网页：扫描/键盘响应
-  else if (curPage == P_SETTINGS) interval = 400;           // 设置页静态，慢刷即可
+  if (curPage == P_WIFI) interval = 120;                    // 配网页：扫描/键盘响应
   // 录音机：录音计时/回放进度要跟上（不录音不播放时也是 250ms 默认值，无需另设）
   else if (curPage == P_RECORDER && gAiState == AVS_RECORDING) interval = 200;
   // 音乐页降到 ~8fps：黑胶转动仍可见，但 QSPI 全屏 DMA 次数减半，
@@ -4103,8 +4112,6 @@ void loop() {
   else if (curPage == P_RADAR) interval = 70;               // 扫描线 ~14 fps
   else if (curPage == P_POMO && pomo.running) interval = 200;
   else if (gAiState == AVS_RECORDING) interval = 250;        // 录音：电平条 4fps
-  // 息屏时 render() 直接返回、没有绘制耗时可让出 CPU，loop 会空转：
-  // 主动让出 15ms（触摸/按键都在各自任务或轮询里，唤醒延迟无感）
-  if (gLocked) { delay(15); return; }
   if (now - lastDraw >= interval) { lastDraw = now; render(); }
+  else delay(1);
 }

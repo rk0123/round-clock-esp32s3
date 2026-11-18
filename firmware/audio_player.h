@@ -35,6 +35,8 @@
 #include <FFat.h>
 #include <SD_MMC.h>
 #include <Preferences.h>
+#include <atomic>
+#include <freertos/semphr.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <math.h>
@@ -42,7 +44,7 @@
 #include "Audio.h"
 #include "es8311.h"
 
-extern bool wifiOK;
+extern std::atomic<bool> wifiOK;
 
 // ------------------------------------------------------------------ 回调日志
 static uint32_t gLastAudioLog = 0;
@@ -136,7 +138,7 @@ static volatile bool   gPodBusy = false;
 // ------------------------------------------------------------------ 运行时状态
 static Audio           *gAudio      = nullptr;
 static es8311_handle_t  gCodec      = nullptr;
-static bool             gAudioReady = false;
+static std::atomic<bool> gAudioReady{false};
 static bool             gConnected  = false;
 enum AudioState : uint8_t { A_IDLE = 0, A_CONNECTING, A_PLAYING, A_PAUSED, A_ERROR };
 static volatile AudioState gAudioState = A_IDLE;
@@ -280,7 +282,24 @@ static int audCount(AudSrc s) {
 }
 
 // ------------------------------------------------------------------ TF 卡
+static SemaphoreHandle_t gTfMutex = nullptr;
+static unsigned gTfTransfers = 0;
+
+class TfLock {
+ public:
+  TfLock() : locked(gTfMutex && xSemaphoreTakeRecursive(gTfMutex, portMAX_DELAY) == pdTRUE) {}
+  ~TfLock() { if (locked) xSemaphoreGiveRecursive(gTfMutex); }
+  explicit operator bool() const { return locked; }
+  TfLock(const TfLock &) = delete;
+  TfLock &operator=(const TfLock &) = delete;
+
+ private:
+  bool locked;
+};
+
 static bool tfEnsure() {
+  TfLock lock;
+  if (!lock) return false;
   if (gTfMounted) return true;
   // 官方 4-bit 引脚；失败再退 1-bit（只用 CLK/CMD/D0）
   SD_MMC.setPins(15, 14, 16, 17, 12, 13);
@@ -295,6 +314,27 @@ static bool tfEnsure() {
   gTfMounted = false;
   return false;
 }
+// 持有文件期间阻止另一个任务重挂载 TF 卡。
+class TfTransfer {
+ public:
+  TfTransfer() {
+    TfLock lock;
+    active = lock && tfEnsure();
+    if (active) ++gTfTransfers;
+  }
+  ~TfTransfer() {
+    if (!active) return;
+    TfLock lock;
+    if (lock) --gTfTransfers;
+  }
+  explicit operator bool() const { return active; }
+  TfTransfer(const TfTransfer &) = delete;
+  TfTransfer &operator=(const TfTransfer &) = delete;
+
+ private:
+  bool active = false;
+};
+
 static bool tfIsAudio(const String &n) {
   String l = n; l.toLowerCase();
   return l.endsWith(".mp3") || l.endsWith(".wav") || l.endsWith(".m4a") ||
@@ -339,6 +379,8 @@ static void tfScanDir(const char *dir, int depth) {
   d.close();
 }
 static void tfScan() {
+  TfLock lock;
+  if (!lock || gTfTransfers) { Serial.println("[TF] card busy"); return; }
   gTfN = 0; gTfDirs = 0; gTfFiles = 0;
   // 热插拔换卡后强制重新枚举；调用方（AQ_RESCAN_TF / AQ_TFTEST）已先 stopSong()
   SD_MMC.end();
@@ -572,8 +614,25 @@ static void audMonitor();
 static void audNext(int dir);
 
 // ------------------------------------------------------------------ 播放动作
+// 采音启用 RX 前，由音频任务确认共享 I²S 的播放已经停止。
+static std::atomic<uint32_t> gCaptureTicket{0}, gCaptureAccepted{0};
+static std::atomic<bool> gCaptureRequested{false};
+
+static bool audioBeginCapture() {
+  const uint32_t ticket = gCaptureTicket.fetch_add(1) + 1;
+  gCaptureRequested.store(true);
+  const uint32_t start = millis();
+  while (gCaptureAccepted.load() != ticket && millis() - start < 450) delay(2);
+  if (gCaptureAccepted.load() == ticket) return true;
+  gCaptureRequested.store(false);
+  Serial.println("[AUD] capture waiting for player stop timed out");
+  return false;
+}
+
+static void audioEndCapture() { gCaptureRequested.store(false); }
+
 static bool audStart(int idx) {
-  if (!gAudioReady) return false;
+  if (gCaptureRequested.load() || !gAudioReady) return false;
   AudTrack *t = audTrackAt(gSrc, idx);
   if (!t) return false;
   gIdx = idx;
@@ -733,6 +792,10 @@ static void audMonitor() {
 // ------------------------------------------------------------------ 命令执行
 static void audExec(const AudCmd &c) {
   if (!gAudioReady) return;
+  if (gCaptureRequested.load() && c.cmd != AQ_STOP && c.cmd != AQ_VOL) {
+    Serial.printf("[AUD] command %u skipped while recording\n", c.cmd);
+    return;
+  }
   switch (c.cmd) {
     case AQ_PLAY:    gAudRetry = 0; audStart(c.arg >= 0 ? c.arg : gIdx); break;
     case AQ_SELECT:  gAudRetry = 0; audStart(c.arg); break;
@@ -847,6 +910,11 @@ static void audioTask(void *) {
     Serial.println("[AUD] Audio alloc FAILED");
   }
   for (;;) {
+    const uint32_t ticket = gCaptureTicket.load();
+    if (gCaptureRequested.load() && gCaptureAccepted.load() != ticket) {
+      audStop();
+      gCaptureAccepted.store(ticket);
+    }
     AudCmd c;
     int budget = 4;
     while (budget-- && xQueueReceive(gAudQ, &c, 0) == pdTRUE) audExec(c);
@@ -940,6 +1008,7 @@ static void audioStatusDump() {
 
 // ------------------------------------------------------------------ 初始化
 static bool audioInit() {
+  gTfMutex = xSemaphoreCreateRecursiveMutex();
   for (int i = 0; i < STREAM_COUNT; i++) {
     strncpy(gRadio[i].name, STREAM_LABELS[i], sizeof(gRadio[i].name) - 1);
     strncpy(gRadio[i].url,  STREAM_URLS[i],  sizeof(gRadio[i].url) - 1);

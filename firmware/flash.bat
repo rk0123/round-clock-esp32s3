@@ -5,7 +5,9 @@ REM  Usage: flash.bat          (defaults to COM12)
 REM         flash.bat COM5     (override port)
 REM ============================================================
 setlocal
-set CLI=C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe
+set "CLI=%ARDUINO_CLI%"
+if not defined CLI for /f "delims=" %%P in ('where arduino-cli.exe 2^>nul') do if not defined CLI set "CLI=%%P"
+if not defined CLI set "CLI=C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe"
 REM %~dp0 ends with a backslash; quoting it escapes the quote, so normalize it
 for %%I in ("%~dp0.") do set "SKETCH=%%~fI"
 set BUILD=%~dp0.build

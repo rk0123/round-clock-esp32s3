@@ -1,5 +1,9 @@
 # RoundClock · ESP32-S3 圆形桌面终端
 
+**v2.6.1** 修复小智问答、语音备忘、录音纪要的百炼转写，并加入小智平台设备绑定。
+本分支的板卡配置、烧录和实机验收见 [v2.6.1 说明](README-zh.md)，烧录文件随 [修复包](artifacts/weixue_esp32_v2.6.1.zip) 提供。
+下文为初版的硬件、功能和架构简介。
+
 一块 **360×360 圆屏** 的桌面小终端，七页可翻：机械表盘、电子钟、音乐播放、航班雷达、番茄钟、Wi-Fi 配网、设置。
 全部界面**自己画**——不依赖 LVGL，直接往 RGB565 帧缓冲里写像素再推屏，所以整块屏的每一个弧线、每一圈刻度、
 每一个像素的字距都是可控的。
@@ -58,29 +62,8 @@
 
 ## 快速开始
 
-需要 **Arduino IDE 的 arduino-cli** + **esp32 core 3.0.7**（IDF 5.1）。
-更高版本未验证，更低版本缺 `ledcAttach` / `quad_mode`。
-
-```bash
-cd firmware
-build.bat            # 编译
-flash.bat COM3       # 烧录（端口改成你的）
-```
-
-FQBN：
-
-```
-esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,CDCOnBoot=cdc,CPUFreq=240,\
-UploadSpeed=921600,PartitionScheme=app3M_fat9M_16MB
-```
-
-**首次配网**：开机后点左上角 Wi-Fi 图标 → 选 SSID → 输入密码 → `JOIN`。
-彩云天气 token 可留空（会自动走免密钥的 Open-Meteo / MET Norway）。
-
-**音频库需要打补丁**：`firmware/patches/ESP32-audioI2S-3.4.0-roundclock.patch`
-（不加会播放 0.3 秒后永久静音，根因见下方"踩过的坑"）。
-
----
+此分支使用 Arduino-ESP32 3.0.7、ArduinoJson 7.4.2、ESP32-audioI2S 3.4.0 和自定义分区
+`app5M_fat7M_16MB`。音频库补丁、编译和烧录步骤见 [v2.6.1 说明](README-zh.md)。
 
 ## 架构要点
 

@@ -147,10 +147,13 @@ void fillRoundRect(int x, int y, int w, int h, int r, uint16_t c) {
 
 void roundRect(int x, int y, int w, int h, int r, uint16_t c) {
   // 用外实心圆角矩形减内实心圆角矩形（背景色由调用方先铺好，这里用描边近似）
-  arcRing(x + r, y + r, r, 180, 270, 1, c);
-  arcRing(x + w - r - 1, y + r, r, 270, 360, 1, c);
-  arcRing(x + r, y + h - r - 1, r, 90, 180, 1, c);
-  arcRing(x + w - r - 1, y + h - r - 1, r, 0, 90, 1, c);
+  // arcRing 的角度约定：0=正上、90=右、180=下、270=左（内部减 90 度）。
+  // 四个角必须按「左→上 / 上→右 / 右→下 / 下→左」的顺序取弧，
+  // 之前整组角度错了一个象限，弧线会斜着扫进胶囊内部，实机上就是四角"缺口"。
+  arcRing(x + r, y + r, r, 270, 360, 1, c);                 // 左上：左 -> 上
+  arcRing(x + w - r - 1, y + r, r, 0, 90, 1, c);            // 右上：上 -> 右
+  arcRing(x + w - r - 1, y + h - r - 1, r, 90, 180, 1, c);   // 右下：右 -> 下
+  arcRing(x + r, y + h - r - 1, r, 180, 270, 1, c);         // 左下：下 -> 左
   line(x + r, y, x + w - r, y, c);
   line(x + r, y + h - 1, x + w - r, y + h - 1, c);
   line(x, y + r, x, y + h - r, c);

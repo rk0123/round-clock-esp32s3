@@ -8,7 +8,7 @@ set CLI=C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino
 REM %~dp0 ends with a backslash; quoting it escapes the quote, so normalize it
 for %%I in ("%~dp0.") do set "SKETCH=%%~fI"
 set BUILD=%~dp0.build
-set FQBN=esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,CDCOnBoot=cdc,CPUFreq=240,UploadSpeed=921600,PartitionScheme=app3M_fat9M_16MB
+set FQBN=esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,CDCOnBoot=cdc,CPUFreq=240,UploadSpeed=921600,PartitionScheme=app5M_fat7M_16MB
 
 if not exist "%CLI%" (
   echo [ERROR] arduino-cli not found: %CLI%

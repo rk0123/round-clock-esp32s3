@@ -79,13 +79,13 @@ void audio_eof_stream(const char *info)  { Serial.printf("[AUD.i] stream eof: %s
 #define I2S_DOUT_PIN   47
 #define I2S_MCLK_PIN    2
 #define PA_EN_PIN       9
-#define AUDIO_SR    44100
+#define AUDIO_SR    48000
 
 // ------------------------------------------------------------------ 音源模型
 enum AudSrc : uint8_t { AS_RADIO = 0, AS_TF = 1, AS_POD = 2, AS_COUNT = 3 };
 // v0.16：TF 卡栏目按用户要求改名 MUSIC；中文栏目名在 UI 的 tab 上单独用 16px 字库绘制
 static const char *const AUD_SRC_NAME[] = {"RADIO", "MUSIC", "PODCAST"};
-#define AUD_MAX_TRACKS 20
+#define AUD_MAX_TRACKS 40   // v1.0：电台扩到 33 条（原来 20 装不下）
 #define AUD_NAME_LEN   64       // v0.16 40->64：中文标题是 3 字节/字，40 字节只能装 13 个字
 #define AUD_URL_LEN   384
 #define AUD_FEED_LEN  256
@@ -116,32 +116,9 @@ static int gPodFeedIdx = 0;
 
 struct AudTrack { char name[AUD_NAME_LEN]; char url[AUD_URL_LEN]; };
 
-// 12 条直链均经 PC 实测 200 / audio/mpeg（2026-11-15）。
-// 前 6 条走国内蜻蜓 CDN，连接快；后 6 条是国际台，TLS 握手慢，排在后面作备用。
-// 注意：SomaFM 会按 User-Agent 拒流，库用的是 VLC/3.0.21 UA，实测可通。
-static const char *const STREAM_URLS[] = {
-  "https://lhttp.qtfm.cn/live/15318317/64k.mp3",
-  "https://lhttp.qtfm.cn/live/4915/64k.mp3",
-  "https://lhttp.qtfm.cn/live/4804/64k.mp3",
-  "https://lhttp.qtfm.cn/live/1301/64k.mp3",
-  "https://lhttp.qtfm.cn/live/1136/64k.mp3",
-  "https://lhttp.qtfm.cn/live/1122/64k.mp3",
-  "https://rfienchinois64k.ice.infomaniak.ch/rfienchinois-64.mp3",
-  "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service",
-  "https://icecast.omroep.nl/radio1-bb-mp3",
-  "https://streams.kqed.org/kqedradio",
-  "https://ice1.somafm.com/groovesalad-128-mp3",
-  "https://ice1.somafm.com/dronezone-128-mp3"
-};
-// v0.16：中文电台名（16px 全量字库，任意汉字都能显示）。
-// 前 6 条是蜻蜓 CDN 的流 ID，服务端不返回 icy-name，故按频道序号如实标注，不虚构台名。
-static const char *const STREAM_LABELS[] = {
-  "蜻蜓FM 频道一", "蜻蜓FM 频道二", "蜻蜓FM 频道三",
-  "蜻蜓FM 频道四", "蜻蜓FM 频道五", "蜻蜓FM 频道六",
-  "法国国际广播 华语", "BBC 世界广播", "荷兰 NPO 一台",
-  "KQED 公共广播", "SomaFM 律动", "SomaFM 氛围"
-};
-#define STREAM_COUNT 12
+// v1.0：电台表移到独立头文件，33 条直链均经 PC 实测（2026-11-17）。
+// 国内 8 条蜻蜓 CDN + 国外 25 条；中央台与地方台多为 HLS 分片，暂不能直连。
+#include "radio_stations_v2.h"
 
 // 兼容旧 UI 变量名：gStation 只表示「电台」下标
 static int gStation = 0;
@@ -187,7 +164,8 @@ static bool     gToneMode     = false;  // TONE 是离线自测，播完必须�
 // ------------------------------------------------------------------ 请求队列
 enum : uint8_t {
   AQ_NONE = 0, AQ_PLAY, AQ_TOGGLE, AQ_NEXT, AQ_STOP, AQ_TONE, AQ_VOL,
-  AQ_SOURCE, AQ_SELECT, AQ_RESCAN_TF, AQ_PODFEED, AQ_PODADD, AQ_PODCLEAR, AQ_TFTEST
+  AQ_SOURCE, AQ_SELECT, AQ_RESCAN_TF, AQ_PODFEED, AQ_PODADD, AQ_PODCLEAR, AQ_TFTEST,
+  AQ_PLAYFILE            // 播一条指定路径的本地音频（录音回放用，text = 完整路径）
 };
 struct AudCmd {
   uint8_t cmd; int arg; int arg2;
@@ -821,6 +799,24 @@ static void audExec(const AudCmd &c) {
       gPodN = 0; podSave(); gIdx = 0;
       Serial.println("[POD] list cleared");
       break;
+    // ---- 录音回放：播一条指定路径的本地文件 ----
+    // 与 audStart(AS_TF) 的区别：路径不在 gTf[] 里（录音目录不进曲库），且**播完就停**
+    // （gToneMode=true 走"本地文件"分支），不会自动续播下一首、也不会当电台重连。
+    case AQ_PLAYFILE: {
+      if (!c.text[0]) break;
+      if (!tfEnsure()) { gAudioState = A_ERROR; Serial.println("[REC] TF not available"); break; }
+      gAudio->stopSong();
+      vTaskDelay(pdMS_TO_TICKS(60));      // 让上一条 socket/DMA 收尾，和 audStart 同款规避
+      bool ok = gAudio->connecttoFS(SD_MMC, c.text);
+      gAudioState = ok ? A_CONNECTING : A_ERROR;
+      gToneMode = true;
+      gAudStartMs = millis(); gAudLastData = millis();
+      gAudLastBuf = 0xFFFFFFFF;
+      gAudLastI2s = gI2sDiag[3]; gAudStartI2s = gI2sDiag[3];
+      gAudRetryAt = 0; gAudRetry = 0;
+      Serial.printf("[REC] playfile '%s' -> %s\n", c.text, ok ? "OK" : "FAILED");
+      break;
+    }
     case AQ_TFTEST:
       if (gAudioReady) { gAudio->stopSong(); gAudioState = A_IDLE; }
       // arg=1 写一个中文文件名，用来端到端验收「TF 卡中文歌名」链路
@@ -846,7 +842,7 @@ static void audioTask(void *) {
     // 旧值 (3000,2000) 让直播流一次 chunk 间隔 >2s 就被误判断连。
     gAudio->setConnectionTimeout(8000, 8000);
     gAudioReady = true;
-    Serial.println("[AUD] Audio/I2S initialized on Core0 (codec 44.1k -> lib resamples 48k)");
+    Serial.println("[AUD] Audio/I2S initialized on Core0 (48 kHz shared with ES7210)");
   } else {
     Serial.println("[AUD] Audio alloc FAILED");
   }

@@ -46,9 +46,39 @@ extern uint8_t Touch_interrupts;
 #define C_BLUE      COL(88, 168, 224)
 #define C_VINYL     COL(13, 17, 24)
 
-enum Page : uint8_t { P_ANALOG = 0, P_DIGITAL, P_MUSIC, P_RADAR, P_POMO, P_WIFI, P_SETTINGS, PAGE_COUNT };
+#include "ui_kit.h"       // 二期统一 UI 组件（页面底 / 圆键 / 胶囊键 / 蛋形）
+#include "pet.h"          // v2.0 拓麻歌子整机（依赖上面的颜色宏 + ui_kit）
+#include "words.h"        // v1.0 百词斩式背单词（内含 wordbank.h）
+#include "mic_recorder.h" // v1.0 ES7210 双麦录音（官方驱动）
+#include "ai_cloud.h"     // v1.0 百炼 ASR / Qwen / Todo / 凭据
+#include "recorder.h"     // v2.5 录音机：WAV 存 TF 卡 + 回放（纪要按需）
+
+// v1.0（二期）：保留 0..6 的历史编号，串口 `PAGE n` 命令不变；新页从 7 起追加。
+enum Page : uint8_t {
+  P_ANALOG = 0, P_DIGITAL, P_MUSIC, P_RADAR, P_POMO, P_WIFI, P_SETTINGS,
+  P_APPS,   // 7  应用中心（除表盘外所有入口，Apple Watch 蜂窝）
+  P_CHAT,   // 8  小智语音问答
+  P_WORDS,  // 9  背单词
+  P_MEMO,   // 10 语音备忘录 / Todo
+  P_PET,    // 11 电子宠物
+  P_RECORDER, // 12 录音机 / AI 会议记录
+  P_TODO,   // 13 Todo 清单
+  PAGE_COUNT
+};
 static Page curPage = P_ANALOG;
 static int  detailIdx = -1;                   // 雷达选中目标详情卡索引
+
+// v2.1：主界面 = 两块表盘（模拟 / 数字），原地切换，不再各占一个入口。
+//   0 = 模拟（机械表盘，默认）  1 = 数字（大字号电子表盘）
+// 切换手势：点轴心（r≤34）或上滑（表盘上下滑是唯一还没被占用的方向，下拉=设置）。
+// 选择写 NVS "face"，掉电保留。
+static int gFace = 0;
+
+// v2.2：数字表盘的文字语言。0 = 中文（星期 + 天气描述）  1 = English
+// **只作用于数字表盘** —— 用户明确「模拟表盘不要改」，机械盘固定保留衬线两字母星期窗
+// 与中文天气副盘（模板做出来就是这个样子，动了反而破坏盘面）。
+// 入口：设置页第 4 行右侧 LANG 卡片（点一下切换），写 NVS "lang"，掉电保留。
+static int gLang = 0;
 
 // v0.16：天气/雷达共用的运行时位置。设置页 CITY 选择后写 NVS，掉电保留；
 // 换城市会同时让天气与 ADS-B 立刻按新坐标重拉。
@@ -64,6 +94,9 @@ static int    gCityScroll = 0;
 static bool gLocked = false;                       // 锁屏状态
 static uint32_t gToastUntil = 0;                   // 临时提示消失时刻
 static char gToast[44] = {0};
+static int  gTodoPage = 0;                         // 待办清单当前页（5 条/页）
+static int  gTodoDeadlineFor = -1;                 // >=0：正在给第 i 条设期限（清单的子页面）
+static uint32_t gTodoClearArmUntil = 0;            // 清空二次确认：首次点后 3s 内再点才清
 // v0.15：屏幕虚拟锁键 / 齿轮及其热区全部删除；息屏用 BOOT 实体键，设置用下拉手势。
 // 右上实体按键 = BOOT 键（GPIO0，板载上拉、按下拉低）。
 // 官方只有这两个实体键：BOOT 可编程，PWR 是硬件电源锁存开关（不支持自定义）。
@@ -77,6 +110,23 @@ static void injectSwipe(int x1, int y1, int x2, int y2);  // 定义在触摸事�
 static void showToast(const char *s) {
   strncpy(gToast, s, sizeof(gToast) - 1); gToast[sizeof(gToast) - 1] = 0;
   gToastUntil = millis() + 1800;
+}
+// 主界面换表盘：模拟 <-> 数字。两页共用 P_ANALOG 这个"家"，
+// 所以进应用中心/回 home 的手势完全不受影响。
+static void toggleClockFace() {
+  gFace = gFace ? 0 : 1;
+  cfgSetInt("face", gFace);
+  showToast(gFace ? "数字表盘" : "模拟表盘");
+  render();
+  Serial.printf("[UI] clock face -> %s\n", gFace ? "DIGITAL" : "ANALOG");
+}
+// 数字表盘语言：中文 <-> English（模拟表盘不受影响）。切完立刻重绘。
+static void toggleLang() {
+  gLang = gLang ? 0 : 1;
+  cfgSetInt("lang", gLang);
+  showToast(gLang ? "LANG: ENGLISH" : "数字表盘 中文");
+  render();
+  Serial.printf("[UI] clock lang -> %s\n", gLang ? "EN" : "CN");
 }
 // drawText() 的 y 是**字形顶部**（字形占 y..y+font*scale-1），不是中心也不是基线。
 // 按钮里若直接把按钮中心 y 传进去，12px 文字会整体偏下 (12/2 - boxH/2 ... ) 约 5~6px。
@@ -177,49 +227,52 @@ static int  gNetEnc[16];
 // v0.15：主页左上角的设置齿轮已删除，改由「任意页面下拉」进入设置页。
 
 // ---------------------------------------------------------------- 设置页布局（圆屏安全区 r≤158）
-// 标题行 y=86（此高度圆内可用 x 65..295），三行卡片 x 46..314
-// v0.16：加了一行 CITY，四行卡片压缩到 y=100..264，底部提示仍留在安全区内
-#define ST_RX      46
-#define ST_RW      268
-#define ST_RH      38
-#define ST_R1     100
-#define ST_R2     142
-#define ST_R3     184
-#define ST_R4     226
+// v2.2 重排：5 行（主界面表盘 / 亮度 / 音量 / [表盘语言|语言] / 城市）。
+//   圆内能放整行 268 宽卡片的 y 区间是 96..264；再往下只有窄卡能进圆。
+//   行高 34 / 间距 4：96, 134, 172, 210, 248（末行 248..282 用 236 宽窄卡）。
+//   原来底部的 IP 状态行删掉（WIFI 行右侧已经显示 SSID/状态，IP 属冗余）。
+#define ST_RX      47
+#define ST_RW      266
+#define ST_RH      34
+#define ST_R1      96
+#define ST_R2      134
+#define ST_R3      172
+#define ST_R4      210
+#define ST_R5      248
+// 第 4 行两颗半宽卡片（FACE 47..175 / LANG 185..313，间隙 10 居中）—— 外缘与上面三行严格对齐
+#define ST_HALF_W  128
+#define ST_FACE_X  47
+#define ST_LANG_X  185
+// 第 5 行城市卡：y=282 时圆内可用 x 只有 62..298，所以只做 236 宽
+#define ST_CITY_X  62
+#define ST_CITY_W  236
 #define ST_BACK_CX 92
-#define ST_BACK_CY 86
-#define ST_BACK_R  18
+#define ST_BACK_CY 76
+#define ST_BACK_R  15
 #define ST_BTN_MINUS_CX 238
 #define ST_BTN_PLUS_CX  290
 #define ST_BTN_R   15
 #define ST_BAR_X   58
 #define ST_BAR_W   150
 
-// ---------------------------------------------------------------- 二维翻页
-// 主页=模拟时钟(中心)，上=收音机，下=雷达，左=番茄钟，右=电子钟。
-// 子页里怎么滑都不会"撞墙"：改成环形顺序继续走（模拟->电子->收音机->雷达->番茄->模拟），
-// 不再弹 "edge" 提示。子页内左右滑=环上前后一格，上下滑同义（子页内方向本身没有对应页）。
-static const Page PAGE_RING[] = { P_ANALOG, P_DIGITAL, P_MUSIC, P_RADAR, P_POMO };
-static const int  PAGE_RING_N = 5;
-
-static Page ringStep(Page p, int d) {
-  int i = 0;
-  for (int k = 0; k < PAGE_RING_N; k++) if (PAGE_RING[k] == p) { i = k; break; }
-  i = (i + d + PAGE_RING_N) % PAGE_RING_N;
-  return PAGE_RING[i];
-}
-
+// ---------------------------------------------------------------- 导航模型（v2.0 起）
+// 除主界面（表盘）外，**所有入口都收进应用中心**，页面之间不再是十字/环形。
+// 手势照手机来（v2.0 用户要求）：
+//   · 表盘     ：左右滑 -> 应用中心          上滑 / 点轴心 -> 换表盘（模拟 <-> 数字，v2.1）
+//   · 应用中心 ：任意方向滑 -> 回表盘
+//   · 任意应用 ：上滑 -> 回表盘（home 手势）；其余方向 -> 回应用中心（上一层）
+// 于是只有三层：表盘 <-> 应用中心 <-> 某个应用；上滑永远是"回桌面"。
+// 表盘上唯一被特殊处理的是上滑 —— 这一层没有 home 可回，正好用来换表盘。
 static bool navigate(char dir) {
   Page np = curPage;
   if (curPage == P_ANALOG) {
-    // 主页：上下左右各自直达对应页（原来的十字映射不变）
-    if      (dir == 'U') np = P_MUSIC;
-    else if (dir == 'D') np = P_RADAR;
-    else if (dir == 'L') np = P_POMO;
-    else if (dir == 'R') np = P_DIGITAL;
+    if (dir == 'L' || dir == 'R') np = P_APPS;
+  } else if (curPage == P_APPS) {
+    np = P_ANALOG;
+  } else if (dir == 'U') {
+    np = P_ANALOG;                 // home：任意应用上滑回表盘
   } else {
-    // 子页：沿环前进 / 后退，永远不会停在原地，也就不会再有"方向出错"提示
-    np = ringStep(curPage, (dir == 'R' || dir == 'D') ? +1 : -1);
+    np = P_APPS;                   // 其余方向 = 返回上一层（应用中心）
   }
   if (np == curPage) return false;
   curPage = np; detailIdx = -1;
@@ -545,6 +598,17 @@ static void mapSkycon(const char *sky, Weather &w) {
   else if (strstr(s, "WIND"))                                  { w.icon = WX_PARTLY; strcpy(w.desc, "风"); }
   else if (strstr(s, "DUST"))                                  { w.icon = WX_FOG;    strcpy(w.desc, "沙尘"); }
   else                                                         { w.icon = WX_CLOUD;  strcpy(w.desc, "阴"); }
+}
+
+// v2.2：表盘上的天气描述跟着表盘语言走。只按 icon 取字，不再依赖云端返回的原始 skycon 文案
+// （mapSkycon/mapWmo 里写进 wx.desc 的中文继续留给串口日志）。
+// 顺序必须与 enum WxIcon 一致：CLEAR / PARTLY / CLOUD / FOG / RAIN / SNOW / STORM。
+static const char *const WX_DESC_CN[] = {"晴", "多云", "阴", "雾", "雨", "雪", "雷雨"};
+static const char *const WX_DESC_EN[] = {"CLEAR", "PARTLY", "CLOUDY", "FOG", "RAIN", "SNOW", "STORM"};
+static inline const char *wxDesc() {
+  int i = (int)wx.icon;
+  if (i < 0 || i > 6) i = 2;
+  return gLang ? WX_DESC_EN[i] : WX_DESC_CN[i];
 }
 
 // 轻量 JSON：从 p 开始的 limit 字节内找 "key":value
@@ -986,6 +1050,10 @@ static void netTask(void *) {
   for (;;) {
     uint32_t now = millis();
 
+    // 云端队列（问答 / 语音转写+纪要）在这里执行：netTask 的 16KB 栈开机就分配好，
+    // 不用每次再挖新栈，TLS 握手才有足够内部 RAM。
+    cloudPollJobs();
+
     // Wi-Fi 状态动态跟踪：断线后又连上（或开机时慢于首次等待）都要能自愈
     bool conn = (WiFi.status() == WL_CONNECTED);
     if (conn != wifiOK) {
@@ -1146,13 +1214,8 @@ static void drawWxIcon(int cx, int cy, int sz, WxIcon ic, uint16_t col) {
 }
 
 // ---------------------------------------------------------------- 通用装饰
-static void pageDots(int y, uint16_t dim) {
-  int x0 = 180 - (PAGE_COUNT - 1) * 7;
-  for (int i = 0; i < PAGE_COUNT; i++)
-    // 未选中点更小更暗，避免底部文字看起来像被加了下划线
-    fillCircle(x0 + i * 14, y, i == (int)curPage ? 3 : 2,
-               i == (int)curPage ? C_ORANGE : dim);
-}
+// v2.0：底部那排页码点全部删除。页面不再是环形序列（表盘 <-> 应用中心 <-> 应用），
+// 页码点既没有意义、15 个点也排不进圆里。
 static bool hit(int x, int y, int cx, int cy, int r) {
   long dx = x - cx, dy = y - cy;
   return dx * dx + dy * dy <= (long)r * r;
@@ -1316,6 +1379,8 @@ static void renderAnalog() {
   drawDialText(260, WIN_Y + 32, dbuf, COL(238, 232, 214));   // 数字 cap24，等宽槽
 
   drawDialWindow(100 - WIN_W / 2, WIN_Y, WIN_W, WIN_H);
+  // v2.2：语言开关**只管数字表盘**（用户明确「模拟表盘不要改」）。
+  // 这里固定走衬线两字母 WDAY_2 —— 中文单字在深底窗里会退化成一条横线，两字母才撑得住窗面。
   drawDialText(100, WIN_Y + 30, WDAY_2[gWday], COL(238, 232, 214));  // 字母 cap21
 
   // 6 点天气副盘：图标 / AA 温度 / 16px 中文 / 电量小格，四行都收在 r=44 圆内
@@ -1347,34 +1412,92 @@ static void renderAnalog() {
 
   // v0.22：底部那排 "WX / CAIYUN / LIVE" 小字已删除（用户嫌破坏表盘观感）。
   // 数据源真伪在天气副盘里看得到（DEMO 时副盘温度本身是演示值），配网状态由 P_WIFI 页负责。
-  pageDots(314, COL(70, 80, 88));
 }
 
-// ================================================================ 页 2 电子表盘
+// ---------------------------------------------------------------- 数字表盘右上角小电池（v2.2）
+// gfx 只有填充版 roundRect，所以用"外层填框色 + 内层填纸色"做出 2px 描边壳，
+// 再按 soc 比例填内胆。配色与模拟盘 6 点副盘的弧形电量一致：
+//   充电 琥珀黄 / ≤15% 红 / 平常 绿。没电池（只有 USB）就画灰壳空腔，不假装 0%。
+static int battSocVal() {
+  if (gBatFakeSoc >= 0) return gBatFakeSoc;
+  return gBat.valid ? gBat.soc : -1;
+}
+// v2.2：数字表盘电量 = 4 个小方块（用户否掉了电池壳造型 —— 太小做不出"壳+极片+液面"）。
+// 竖排在天气图标左侧，从下往上点亮：25%/格。配色沿用全机一套（≤15% 红 / 平常绿）。
+// 充电：**流水灯**（用户要求，去掉原来那个小闪电）—— 一格亮琥珀从底往上跑，1.6s 一圈；
+//   已达电量的格留淡琥珀底、未达的留淡灰空槽，于是"在充"和"充到哪"两个信息同时读得出。
+static void drawBatteryBlocks(int x, int y) {
+  const int N = 4, BW = 9, BH = 6, GAP = 2;
+  int  soc0 = battSocVal();
+  bool chg  = (gBatFakeSoc >= 0) ? (gBatFakeChg > 0) : gBat.charging;
+  int  soc  = soc0 < 0 ? 0 : (soc0 > 100 ? 100 : soc0);
+  bool low  = (soc0 >= 0 && !chg && soc <= 15);
+
+  uint16_t on  = low ? COL(220, 60, 48) : COL(66, 178, 108);
+  uint16_t off = COL(210, 205, 192);          // 未点亮：比纸色深一档，像"空槽"
+
+  int lit = (soc0 < 0) ? 0 : (soc * N + 50) / 100;
+  if (soc0 >= 0 && soc > 0 && lit < 1) lit = 1;
+
+  // 充电流水：700ms 一格（用户："速度慢一点"，400 → 700）→ 2.8s 一圈。
+  // 表盘 4fps 刷新，每格大约停在屏上 2~3 帧，光点是"上爬"而不是"闪"。
+  const uint16_t c_hot = COL(240, 168, 40);   // 当前跑动的光点
+  const uint16_t c_dim = COL(250, 214, 168);  // 已达电量的格（淡琥珀底）
+  const uint16_t c_off = COL(226, 220, 204);  // 未达电量的空槽（淡灰）
+  int phase = (int)((millis() / 700) % N);    // 0 = 最下面那格
+
+  for (int i = 0; i < N; i++) {                // i=0 是最上面那格
+    int idx = N - 1 - i;                       // 0 = 最下面那格
+    int by  = y + i * (BH + GAP);
+    uint16_t col;
+    if (chg) col = (idx == phase) ? c_hot : (idx < lit ? c_dim : c_off);
+    else     col = (idx < lit) ? on : off;
+    fillRoundRect(x, by, BW, BH, 1, col);      // r=1：9×6 用 r=2 会圆成小胶囊
+  }
+}
+
+// ================================================================ 主界面 · 数字表盘
+// v2.1（用户要求）：秒的**数字去掉**，大时间挪到**正中心**。
+//   秒没有丢——外圈那圈橙色圆弧本身就是秒针（0..60 秒绕满一圈），
+//   一个两位数挤在冒号下面既抢戏又和中间的"重心"打架。
+// 版式（360 圆，安全区 r≤158，上下两块重心距圆心各 88~89，视觉居中）：
+//   星期 y=62 / 日期 y=92（24px，各叠绘一遍加粗）
+//   大时间 148..208（AA 墨迹 57 高，中心 = 180）
+//   分隔线 y=226 / 天气块 240..292
 static void renderDigital() {
   clear(C_PAPER);
-  // v0.27：整圈外扩 158/150 → **172/164**。省下来的边全部换成字号：
-  // 星期/日期 16 → 24px，天气描述 16 → 24px，高低温 12 → 16px，天气图标 36 → 48。
+  // v0.27：整圈外扩 158/150 → **172/164**。省下来的边全部换成字号：星期/日期 16 → 24px，
+  // 天气描述 16 → 24px，高低温 12 → 16px，天气图标 36 → 48。
   circle(180, 180, 172, COL(216, 212, 200));
   circle(180, 180, 164, COL(222, 217, 204), 5);
-  arcRing(180, 180, 164, 0, (int)(360.0f * gSec / 60.0f), 5, C_ORANGE);
+  arcRing(180, 180, 164, 0, (int)(360.0f * gSec / 60.0f), 5, C_ORANGE);   // 外弧 = 秒
   // 顶部星期 / 日期：24px 点阵在纸色底上偏细，各叠绘一遍做加粗（沿用 v0.22 手法）
   uint16_t dcol = COL(141, 136, 122);
-  drawText(180, 30, WDAY_EN[gWday], dcol, 24, 1, 1);
-  drawText(181, 30, WDAY_EN[gWday], dcol, 24, 1, 1);
+  // v2.2：星期随表盘语言（中文「星期三」/ 英文 "WEDNESDAY"）。日期保持数字，两种语言通用。
+  char wdbuf[16];                  // 「星期」+ 单字 = 10 字节 UTF-8，别按字面宽度开 8
+  if (gLang) {
+    drawText(180, 62, WDAY_EN[gWday], dcol, 24, 1, 1);
+    drawText(181, 62, WDAY_EN[gWday], dcol, 24, 1, 1);
+  } else {
+    snprintf(wdbuf, sizeof(wdbuf), "星期%s", WDAY_CN[gWday]);
+    drawText(180, 62, wdbuf, dcol, 24, 1, 1);
+    drawText(181, 62, wdbuf, dcol, 24, 1, 1);
+  }
   // 完整年月日来自 SNTP；未对时则用软时钟继续走，不再硬编码 2026-11
   char dbuf[24]; snprintf(dbuf, sizeof(dbuf), "%04d-%02d-%02d", gYear, gMon, gDay);
-  drawText(180, 60, dbuf, dcol, 24, 1, 1);
-  drawText(181, 60, dbuf, dcol, 24, 1, 1);
+  drawText(180, 92, dbuf, dcol, 24, 1, 1);
+  drawText(181, 92, dbuf, dcol, 24, 1, 1);
 
-  // 大时间：4-bit AA 数字，冒号墨迹中心精确落在 x=180
+  // 天气块左侧 4 格小方块电量（v2.2）：9×6 方块 + 2px 间隙，总高 30，(82,250)..(91,280)
+  // —— 竖中心 265 略高于天气图标中心 268（用户第三次反馈"电池还要往上一点"）。
+  // 充电走流水灯，不再画闪电。外圈 r=172/164 完全没动。
+  drawBatteryBlocks(82, 250);
+
+  // 大时间：4-bit AA 数字，冒号墨迹中心精确落在 x=180；纵向墨迹中心落在 y=180
+  // v2.2：用户反馈两次"时间再往上一点" —— 行框 148 → 142 → **138**（AA 墨迹 57 高）
   char tbuf[8]; snprintf(tbuf, sizeof(tbuf), "%02d:%02d", gHour, gMin);
-  drawBigText(180, 96, tbuf, C_INK);
-  // 秒数字留着（信息是真的），只去掉它下面那行 "SEC" 标签 —— 一个两位数在
-  // 冒号时间下面，谁都知道是秒，占 12px 高度不值。
-  char sbuf[6]; snprintf(sbuf, sizeof(sbuf), "%02d", gSec);
-  drawMidText(180, 182, sbuf, C_ORANGE, 1);
-  line(112, 230, 248, 230, COL(200, 195, 180));
+  drawBigText(180, 138, tbuf, C_INK);
+  line(112, 226, 248, 226, COL(200, 195, 180));
 
   // 天气：图标 48 / AA 加粗温度 / 24px 中文描述；高低温挂到温度**正下方**成一组
   // （原来挂在描述下面，画面成了 L 形，重心偏右下）
@@ -1385,10 +1508,9 @@ static void renderDigital() {
   char rbuf[12]; snprintf(rbuf, sizeof(rbuf), "%d/%d", wx.lo, wx.hi);
   drawText(174, 282, rbuf, COL(141, 136, 122), 16, 1, 0);
   drawDegree(174 + textWidth(rbuf, 16, 1) + 2, 288, COL(141, 136, 122), 2);
-  drawText(232, 250, wx.desc, COL(58, 74, 68), 24, 1, 0);
-
-  // v0.22：删掉底部 "WX / CAIYUN / LIVE" 小字，只留页码点
-  pageDots(322, COL(201, 197, 184));
+  // v2.2：描述起点 232 → 226。英文最长的 "PARTLY"/"CLOUDY" 是 6 字 ×12px = 72 宽，
+  // 从 232 起右端到 304，已经贴到秒环内缘（y=250 处环在 x≈314）；左移 6px 留出安全余量。
+  drawText(226, 250, wxDesc(), COL(58, 74, 68), 24, 1, 0);
 }
 
 // ================================================================ 页 3 音乐（三音源 + 黑胶转动）
@@ -1520,7 +1642,6 @@ static void renderMusic() {
   // ⚠️ 必须显式传 16：drawBtnText 默认 font=12，而 FONT12 只有 ASCII，
   // 中文会静默画不出来（按钮变成空块）。
   drawBtnText(242, 284, 16, src == AS_TF ? "重扫" : src == AS_POD ? "更新" : "切台", C_WHITE, 16);
-  pageDots(328, COL(60, 68, 82));
 }
 
 // ================================================================ 页 4 航班雷达
@@ -1681,7 +1802,6 @@ static void renderRadar() {
       drawText(x0 + nw + 6, 298, cn, COL(63, 138, 104), 16, 1, 0);
     }
   }
-  pageDots(324, COL(30, 70, 52));
 }
 
 // ================================================================ 页 5 番茄钟
@@ -1765,7 +1885,6 @@ static void renderPomo() {
 
   // 底部 "START / RESET / SKIP" 操作提示已删除（三个键自己会说话）。
   // 页码点放在内容区底部（r≈132），别贴到刻度环上——y=322 时正好落进环带，看着像脏点
-  pageDots(312, COL(60, 68, 82));
 }
 
 // ================================================================ 页 6 本机 Wi-Fi 配网
@@ -2087,16 +2206,16 @@ static void wifiConnect() {
 
 static void drawSliderRow(int rowY, const char *label, int val, int vmax, const char *valTxt) {
   fillRoundRect(ST_RX, rowY, ST_RW, ST_RH, 10, COL(28, 36, 44));
-  drawText(ST_BAR_X, rowY + 12, label, COL(150, 162, 182), 12, 1, 0);
+  drawText(ST_BAR_X, rowY + 9, label, COL(150, 162, 182), 12, 1, 0);
   // 数值（右对齐到进度条末端）
-  drawText(ST_BAR_X + ST_BAR_W, rowY + 12, valTxt, C_WHITE, 12, 1, 2);
+  drawText(ST_BAR_X + ST_BAR_W, rowY + 9, valTxt, C_WHITE, 12, 1, 2);
   // 进度条
-  fillRoundRect(ST_BAR_X, rowY + 26, ST_BAR_W, 8, 4, COL(52, 62, 74));
+  fillRoundRect(ST_BAR_X, rowY + 22, ST_BAR_W, 8, 4, COL(52, 62, 74));
   int w = (vmax > 0) ? (val * ST_BAR_W / vmax) : 0;
   if (w < 6 && val > 0) w = 6;
-  if (w > 0) fillRoundRect(ST_BAR_X, rowY + 26, w, 8, 4, C_ORANGE);
+  if (w > 0) fillRoundRect(ST_BAR_X, rowY + 22, w, 8, 4, C_ORANGE);
   // [-] [+]
-  int cy = rowY + 21;
+  int cy = rowY + 17;
   fillCircle(ST_BTN_MINUS_CX, cy, ST_BTN_R, C_SLATE);
   fillRect(ST_BTN_MINUS_CX - 6, cy - 1, 12, 3, C_WHITE);
   fillCircle(ST_BTN_PLUS_CX, cy, ST_BTN_R, C_SLATE);
@@ -2106,19 +2225,21 @@ static void drawSliderRow(int rowY, const char *label, int val, int vmax, const 
 
 static void renderSettings() {
   clear(C_DARK2);
-  drawText(180, ST_BACK_CY, "SETTINGS", C_WHITE, 16, 1, 1);
+  // 标题行从 y=86 提到 68：5 行卡片从 y=96 起，标题留在 86 会被第一行盖住。
+  // 返回键同步上移到 (92,76)、半径 18→15（圆内 y=61 处可用 x 只到 107）。
+  drawText(180, ST_BACK_CY - 8, "SETTINGS", C_WHITE, 16, 1, 1);
   fillRoundRect(ST_BACK_CX - ST_BACK_R, ST_BACK_CY - 14, ST_BACK_R * 2, 28, 8, C_SLATE);
   drawBtnText(ST_BACK_CX, ST_BACK_CY - 14, 28, "<", C_WHITE, 16);
 
   // ── 第 1 行：Wi-Fi（显示当前 SSID / 状态，点击进配网页）
   fillRoundRect(ST_RX, ST_R1, ST_RW, ST_RH, 10, COL(28, 36, 44));
-  drawWifiIcon(ST_RX + 22, ST_R1 + 21, wifiOK ? C_GREEN : C_GREY);
-  drawText(ST_RX + 40, ST_R1 + 14, "WIFI", C_WHITE, 12, 1, 0);
+  drawWifiIcon(ST_RX + 22, ST_R1 + 18, wifiOK ? C_GREEN : C_GREY);
+  drawText(ST_RX + 40, ST_R1 + 11, "WIFI", C_WHITE, 12, 1, 0);
   const char *st = wifiOK ? gCfg.ssid.c_str() : (gCfg.ssid.length() ? "CONNECTING.." : "NOT SET");
   char wbuf[26];
   fitText(wbuf, sizeof(wbuf), st, 12, 150);
-  drawText(ST_RX + ST_RW - 26, ST_R1 + 14, wbuf, wifiOK ? C_GREEN : C_GREY, 12, 1, 2);
-  drawText(ST_RX + ST_RW - 12, ST_R1 + 14, ">", C_GREY, 12, 1, 1);
+  drawText(ST_RX + ST_RW - 26, ST_R1 + 11, wbuf, wifiOK ? C_GREEN : C_GREY, 12, 1, 2);
+  drawText(ST_RX + ST_RW - 12, ST_R1 + 11, ">", C_GREY, 12, 1, 1);
 
   // ── 第 2 行：亮度
   char b[8]; snprintf(b, sizeof(b), "%d%%", gBright);
@@ -2128,19 +2249,23 @@ static void renderSettings() {
   char v[10]; snprintf(v, sizeof(v), "%d/%d", gVolume, VOL_MAX);
   drawSliderRow(ST_R3, "VOLUME", gVolume, VOL_MAX, v);
 
-  // ── 第 4 行：天气城市（v0.16）。城市名是中文，必须走 16px 全量字库。
-  fillRoundRect(ST_RX, ST_R4, ST_RW, ST_RH, 10, COL(28, 36, 44));
-  drawText(ST_RX + 18, ST_R4 + 13, "CITY", C_WHITE, 12, 1, 0);
-  drawBtnText(ST_RX + ST_RW - 30, ST_R4, ST_RH, CITIES[gCityIdx].name, C_GREEN, 16, 1, 2);
-  drawText(ST_RX + ST_RW - 12, ST_R4 + 13, ">", C_GREY, 12, 1, 1);
+  // ── 第 4 行：左 FACE 主界面表盘（模拟 / 数字）/ 右 LANG 数字表盘语言
+  fillRoundRect(ST_FACE_X, ST_R4, ST_HALF_W, ST_RH, 10, COL(28, 36, 44));
+  drawText(ST_FACE_X + 14, ST_R4 + 11, "FACE", C_WHITE, 12, 1, 0);
+  // 值就是表盘名本身：一眼看清 home 现在是哪块脸
+  drawBtnText(ST_FACE_X + ST_HALF_W - 12, ST_R4, ST_RH, gFace ? "数字" : "模拟",
+              gFace ? COL(126, 200, 240) : C_ORANGE, 16, 1, 2);
 
-  // 底部状态行（IP / 离线提示）
-  char info[40];
-  if (wifiOK) snprintf(info, sizeof(info), "%s", WiFi.localIP().toString().c_str());
-  else        snprintf(info, sizeof(info), "OFFLINE - TAP WIFI");
-  drawText(180, 272, info, C_GREY, 12, 1, 1);
-  // 手势提示：任意页面从上往下拉呼出设置，本页上推或点 < 返回
-  drawText(180, 294, "PULL DOWN = SETTINGS", C_GREY, 12, 1, 1);
+  fillRoundRect(ST_LANG_X, ST_R4, ST_HALF_W, ST_RH, 10, COL(28, 36, 44));
+  drawText(ST_LANG_X + 14, ST_R4 + 11, "LANG", C_WHITE, 12, 1, 0);
+  drawBtnText(ST_LANG_X + ST_HALF_W - 12, ST_R4, ST_RH, gLang ? "ENG" : "中文",
+              gLang ? COL(126, 200, 240) : C_ORANGE, 16, 1, 2);
+
+  // ── 第 5 行：天气城市（城市名是中文，必须走 16px 全量字库）
+  fillRoundRect(ST_CITY_X, ST_R5, ST_CITY_W, ST_RH, 10, COL(28, 36, 44));
+  drawText(ST_CITY_X + 16, ST_R5 + 11, "CITY", C_WHITE, 12, 1, 0);
+  drawBtnText(ST_CITY_X + ST_CITY_W - 24, ST_R5, ST_RH, CITIES[gCityIdx].name, C_GREEN, 16, 1, 2);
+  drawText(ST_CITY_X + ST_CITY_W - 12, ST_R5 + 11, ">", C_GREY, 12, 1, 1);
 }
 
 // ---------------------------------------------------------------- 天气城市选择浮层
@@ -2261,6 +2386,14 @@ static bool settingsTap(int x, int y) {
     render(); return true;
   }
   if (y >= ST_R4 && y <= ST_R4 + ST_RH) {
+    if (x < 180) {                 // 左半：主界面表盘 模拟 <-> 数字（home 只显示选中的那一块）
+      toggleClockFace();
+    } else {                       // 右半：数字表盘语言 中文 <-> English
+      toggleLang();
+    }
+    return true;
+  }
+  if (y >= ST_R5 && y <= ST_R5 + ST_RH) {
     gCityList = true;
     gCityScroll = gCityIdx / CITY_ROWS;
     render(); return true;
@@ -2268,17 +2401,579 @@ static bool settingsTap(int x, int y) {
   return true;   // 设置页吞掉其余点击，避免误触翻页
 }
 
+// ================================================================ 应用中心（Apple Watch 蜂窝）
+// 除主界面（模拟/数字两块表盘）外，所有入口都收在这里。布局是错位蜂窝（正三角网格）：
+//   行 y= 72 : x=180                          （1 格 · 设置 坐顶点）
+//   行 y=130 : x=146, 214                     （2 格）
+//   行 y=188 : x=112, 180, 248                （3 格）
+//   行 y=246 : x= 78, 146, 214, 282           （4 格）
+// 列距 68 / 行距 58（= 68*√3/2 ≈ 58.9），对角线相邻圆心距 67.2，图标 r=32 -> 间隙 3~4px。
+// v2.2：改成**正三角形 1+2+3+4 = 10 格**，10 个入口刚好排满一个三角形（原来是 2/3/4/3 的
+// 圆饼形，底行两侧留两个预留位）。设置挪到顶点最上面 —— 它是"全局"入口，站最高一格；
+// 其余 9 个功能按 2/3/4 往下一层层铺开。顶点 (180,72) 外缘 140、最外格 (282,246) 外缘 153.5，
+// 都在 r158 安全区内；底缘 278，下面留 home 指示条。再加第 11 个入口时得往外扩一行（1/2/3/4/3）。
+// 每格 = 功能图形（上半，26×26）+ 两字名称（下半，FONT16）—— 图形表达功能，文字兜底可读性。
+// 格位与图形解耦（APP_GLYPH[]），`APP_GLYPH[i] < 0` 的预留位画法仍然保留，留作以后插空。
+#define APP_N        10
+#define APP_TILE_R   32
+#define APP_HIT_R    36
+
+static const int APP_X[APP_N] = {180, 146, 214, 112, 180, 248,  78, 146, 214, 282};
+static const int APP_Y[APP_N] = { 72, 130, 130, 188, 188, 188, 246, 246, 246, 246};
+static const char *const APP_LABEL[APP_N] = {"设置",
+                                             "音乐", "雷达", "番茄", "小智", "单词",
+                                             "备忘", "宠物", "录音", "待办"};
+static const Page APP_PAGE[APP_N] = {P_SETTINGS,
+                                     P_MUSIC, P_RADAR, P_POMO, P_CHAT, P_WORDS,
+                                     P_MEMO,  P_PET,   P_RECORDER, P_TODO};
+// 图形编号（drawAppGlyph 里的 case），与格位解耦：增删入口不用重排图形
+static const int APP_GLYPH[APP_N] = {11, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+// 每格一个强调色，图形和描边同色 —— 不靠文字也能一眼分辨
+static const uint16_t APP_COL[APP_N] = {
+  COL(188, 198, 212),   // 设置 银
+  COL(246, 168,  86),   // 音乐 橙
+  COL(104, 214, 150),   // 雷达 绿
+  COL(238, 104,  92),   // 番茄 红
+  COL(250, 206,  90),   // 小智 黄
+  COL(150, 196, 246),   // 单词 蓝
+  COL(120, 222, 186),   // 备忘 青
+  COL(240, 176,  96),   // 宠物 驼
+  COL(232, 146, 108),   // 录音 砖红
+  COL(140, 214, 158)    // 待办 草绿
+};
+
+// 格内功能图形（26×26，中心 cx,cy）。bg 用来"挖空"细节（眼睛、指针、齿轮轴）。
+static void drawAppGlyph(int id, int cx, int cy, uint16_t c) {
+  const uint16_t bg = COL(30, 38, 48);
+  switch (id) {
+    case 0:   // 时钟：表盘 + 时针分针（v2.1 起主界面自带两种表盘，此图形暂未上墙，留作扩充）
+      circle(cx, cy, 10, c, 2);
+      line(cx, cy, cx, cy - 6, c, 2);
+      line(cx, cy, cx + 6, cy + 3, c, 2);
+      fillCircle(cx, cy, 2, c);
+      break;
+    case 1:   // 音乐：八分音符
+      fillCircle(cx - 4, cy + 6, 4, c);
+      line(cx - 1, cy + 6, cx - 1, cy - 8, c, 2);
+      line(cx - 1, cy - 8, cx + 7, cy - 6, c, 2);
+      line(cx + 7, cy - 6, cx + 7, cy + 1, c, 2);
+      break;
+    case 2:   // 雷达：同心圈 + 扇形扫描 + 光点
+      circle(cx, cy, 10, c, 2);
+      circle(cx, cy, 5, mix(c, bg, 80), 1);
+      fillTri(cx, cy, cx + 9, cy - 9, cx + 11, cy - 2, mix(c, bg, 60));
+      line(cx, cy, cx + 9, cy - 9, c, 2);
+      fillCircle(cx + 9, cy - 9, 2, c);
+      break;
+    case 3:   // 番茄钟：番茄 + 梗叶 + 指针
+      fillCircle(cx, cy + 2, 9, c);
+      line(cx, cy - 8, cx, cy - 12, c, 2);
+      line(cx - 5, cy - 9, cx + 5, cy - 9, c, 2);
+      line(cx, cy + 2, cx, cy - 4, bg, 2);
+      line(cx, cy + 2, cx + 4, cy + 4, bg, 2);
+      break;
+    case 4:   // 小智：对话气泡 + 三个点
+      fillRoundRect(cx - 12, cy - 10, 24, 16, 7, c);
+      fillTri(cx - 6, cy + 4, cx - 1, cy + 4, cx - 6, cy + 11, c);
+      fillCircle(cx - 6, cy - 2, 2, bg);
+      fillCircle(cx, cy - 2, 2, bg);
+      fillCircle(cx + 6, cy - 2, 2, bg);
+      break;
+    case 5:   // 单词：单词卡（亮卡 + 深色 A）—— 26px 下画"摊开的书"只会看成两块色块
+      fillRoundRect(cx - 9, cy - 11, 18, 22, 3, c);
+      drawText(cx, cy - 6, "A", bg, 12, 1, 1);
+      break;
+    case 6:   // 备忘：麦克风
+      fillRoundRect(cx - 4, cy - 12, 9, 13, 4, c);
+      arcRing(cx, cy - 2, 9, 100, 260, 2, c);
+      line(cx, cy + 7, cx, cy + 10, c, 2);
+      line(cx - 6, cy + 10, cx + 6, cy + 10, c, 2);
+      break;
+    case 7:   // 宠物：圆头 + 两只圆耳 + 眼睛 + 嘴（和宠物页那只同气质，但线描更好认）
+      fillCircle(cx - 9, cy - 8, 4, c);
+      fillCircle(cx + 9, cy - 8, 4, c);
+      fillRoundRect(cx - 11, cy - 9, 23, 20, 8, c);
+      fillCircle(cx - 4, cy - 1, 2, bg);
+      fillCircle(cx + 4, cy - 1, 2, bg);
+      fillRect(cx - 3, cy + 5, 6, 2, bg);
+      break;
+    case 8: { // 录音：波形竖条
+      static const int BH[5] = {9, 15, 21, 15, 9};
+      for (int i = 0; i < 5; i++)
+        fillRoundRect(cx - 11 + i * 5, cy - BH[i] / 2, 3, BH[i], 1, c);
+      break;
+    }
+    case 9:   // 待办：清单（第一条打勾）
+      for (int i = 0; i < 3; i++) {
+        int yy = cy - 9 + i * 8;
+        rect(cx - 12, yy, 6, 6, c, 1);
+        line(cx - 3, yy + 3, cx + 12, yy + 3, c, 2);
+        if (i == 0) {
+          line(cx - 11, yy + 3, cx - 9, yy + 5, c, 1);
+          line(cx - 9, yy + 5, cx - 7, yy + 1, c, 1);
+        }
+      }
+      break;
+    case 10:  // 配网：Wi-Fi 扇形（已收进设置页首行，此图形暂未上墙，留作扩充）
+      arcRing(cx, cy + 8, 12, 305, 415, 3, c);
+      arcRing(cx, cy + 8, 7, 315, 405, 3, c);
+      fillCircle(cx, cy + 8, 2, c);
+      break;
+    case 11:  // 设置：齿轮（8 齿 + 中心孔）
+      circle(cx, cy, 8, c, 2);
+      for (int k = 0; k < 8; k++) {
+        float a = k * 45.0f * PI / 180.0f;
+        line(cx + (int)(8.0f * cosf(a)),  cy + (int)(8.0f * sinf(a)),
+             cx + (int)(12.0f * cosf(a)), cy + (int)(12.0f * sinf(a)), c, 3);
+      }
+      fillCircle(cx, cy, 3, bg);
+      break;
+    default: break;
+  }
+}
+
+static void appTile(int i) {
+  int cx = APP_X[i], cy = APP_Y[i];
+  if (APP_GLYPH[i] < 0) {
+    // 预留位：不画底座，只留一圈虚线 + 一颗淡十字 —— 一眼看出"这里以后会有功能"，
+    // 又不会亮到抢走真图标的注意力（点击只弹一句提示，不跳页）。
+    for (int k = 0; k < 8; k++)
+      arcRing(cx, cy, APP_TILE_R - 4, k * 45, k * 45 + 22, 2, COL(56, 66, 82));
+    fillRect(cx - 1, cy - 7, 3, 15, COL(52, 62, 78));
+    fillRect(cx - 7, cy - 1, 15, 3, COL(52, 62, 78));
+    return;
+  }
+  uint16_t c = APP_COL[i];
+  // 立体底座：下投影 + 深色圆 + 强调色描边 + 内圈弱光（和 uiBtn 同一套立体语言）
+  fillCircle(cx, cy + 2, APP_TILE_R, COL(8, 12, 16));
+  fillCircle(cx, cy, APP_TILE_R, COL(30, 38, 48));
+  circle(cx, cy, APP_TILE_R, c, 2);
+  circle(cx, cy, APP_TILE_R - 4, mix(COL(30, 38, 48), c, 64), 1);
+  drawAppGlyph(APP_GLYPH[i], cx, cy - 8, c);
+  drawBtnText(cx, cy + 7, 16, APP_LABEL[i], COL(226, 234, 244), 16, 1, 1);
+}
+
+static void renderApps() {
+  // 蜂窝图标墙：没有标题栏、没有返回键 —— Apple Watch 观感，
+  // 进出全靠手势（左右滑进、上滑回表盘），底部一条手机式 home 指示条提示可上滑。
+  clear(C_DARK);
+  fillCircle(180, 180, 172, COL(14, 19, 26));
+  circle(180, 180, 168, COL(46, 58, 72), 2);
+  for (int i = 0; i < APP_N; i++) appTile(i);
+  fillRoundRect(158, 316, 44, 5, 2, COL(96, 106, 122));
+}
+
+// ================================================================ v1.0 功能页公共件
+// 返回键放标题栏左侧空白 (106,62) r16：距圆心 sqrt(74^2+118^2)=139 +16=155 < 158 安全区。
+// 旧版 (48,62) 距圆心 177 被外壳挡住；(90,88) 虽在安全区却正好压住 y>=76 的转写/待办首行
+// ——离线预览 v2 抓到的回归。现位置在分隔线以上、正文 y>=76 以下都不重叠。
+// 单词页三颗词书按钮已右移到 cx=145/197/249, y=64，给这颗返回键让位。
+// FB_BACK_* 已移到 ui_kit.h（头文件 wordTap 也要用，定义在这里会编译失败）
+static void drawFeatureBack() {
+  fillCircle(FB_BACK_CX, FB_BACK_CY, FB_BACK_R, COL(38, 46, 58));
+  circle(FB_BACK_CX, FB_BACK_CY, FB_BACK_R, COL(78, 90, 110), 2);
+  drawBtnText(FB_BACK_CX, FB_BACK_CY - 8, 16, "<", C_WHITE, 16);
+}
+
+// UTF-8 安全的居中自动换行：按整字符累加像素宽，超宽断到下一行。
+// x = 行中心；y = 第一行字形顶部；返回实际画了几行。
+static int drawWrapText(const char *s, int x, int y, int maxW, int lineH,
+                        int maxLines, uint16_t col, int font) {
+  if (!s || !*s) return 0;
+  int lines = 0;
+  const char *p = s;
+  char buf[96];
+  while (*p && lines < maxLines) {
+    int n = 0; buf[0] = 0;
+    while (*p) {
+      unsigned char c = (unsigned char)*p;
+      int clen = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+      if (*(p + clen - 1) == 0) clen = strlen(p);   // 尾部残串保护
+      if (clen == 1 && *p == '\n') { p++; break; }
+      char tmp[8]; memcpy(tmp, p, clen); tmp[clen] = 0;
+      if (n > 0 && textWidth(buf, font, 1) + textWidth(tmp, font, 1) > maxW) break;
+      memcpy(buf + n, p, clen); n += clen; buf[n] = 0;
+      p += clen;
+    }
+    if (n == 0 && !*p) break;
+    drawText(x, y + lines * lineH, buf, col, font, 1, 1);
+    lines++;
+  }
+  return lines;
+}
+
+// 三个语音页共用的大圆键：IDLE「说话/录音」→ RECORDING「停止」→ PROCESSING「识别中」
+static void drawVoiceButton(int cx, int cy, int r, const char *idleLabel) {
+  bool rec = gAiState == AVS_RECORDING;
+  bool proc = gAiState == AVS_PROCESSING;
+  const char *lab = rec ? "停止" : proc ? "识别中" : idleLabel;
+  uiBtn(cx, cy, r, lab, rec ? UI_D : proc ? UI_N : UI_A, 24);
+  if (rec) {
+    // 电平条画在圆键**内部下方**（不放圆外）：录音机键已在 y=288，
+    // 若按老写法 cy+r+22 会到 y=350，四角距圆心 188 远超安全区 158。
+    int bw = (int)(r * 1.6);
+    int by = cy + 10;
+    fillRoundRect(cx - bw / 2, by, bw, 6, 3, COL(70, 30, 30));
+    int lv = constrain(gAiRms / 8, 0, 100);
+    if (lv > 0) fillRoundRect(cx - bw / 2, by, bw * lv / 100, 6, 3, C_GREEN);
+  }
+}
+
+// ---------------- 小智问答：语音提问 → Qwen 答复 ----------------
+// 结果是否属于当前页：问答 / 备忘 / 会议各看各的，切页不串台。
+// 串口 QWEN 的纯文字结果落 gLastAnswer，只属于问答页。
+static bool aiResFor(AiVoiceMode m) {
+  return gAiResultOwner == m && (gAiTranscript.length() || gAiResult.length());
+}
+static bool gXzPageOpen = false;
+
+static void renderXzBinding() {
+  uiPage("小智绑定", C_ORANGE_D);
+  XzBinding state = gXzState.load();
+  switch (state) {
+    case XzBinding::Fetching:
+      drawText(180, 122, "正在查询设备", C_CREAM, 16, 1, 1);
+      break;
+    case XzBinding::Waiting: {
+      drawText(180, 92, "xiaozhi.me", C_CREAM, 16, 1, 1);
+      char code[7];
+      snprintf(code, sizeof(code), "%06d", constrain(gXzCode.load(), 0, 999999));
+      drawText(180, 125, code, C_WHITE, 24, 2, 1);
+      drawText(180, 196, "在平台输入绑定码", C_GREY, 16, 1, 1);
+      drawText(180, 220, "等待确认", C_GREY, 16, 1, 1);
+      break;
+    }
+    case XzBinding::Bound:
+      drawText(180, 122, "设备已绑定", C_GREEN, 16, 2, 1);
+      break;
+    case XzBinding::Offline:
+      drawText(180, 122, "请连接 Wi-Fi", C_CREAM, 16, 1, 1);
+      break;
+    case XzBinding::Failed: {
+      drawText(180, 122, "查询绑定失败", C_CREAM, 16, 1, 1);
+      char status[20];
+      snprintf(status, sizeof(status), "XZ %d", gXzStatus.load());
+      drawText(180, 156, status, C_GREY, 16, 1, 1);
+      break;
+    }
+    case XzBinding::Expired:
+      drawText(180, 122, "绑定码已过期", C_CREAM, 16, 1, 1);
+      break;
+    case XzBinding::Idle:
+      break;
+  }
+  if (state != XzBinding::Waiting && state != XzBinding::Fetching)
+    uiBtn(180, 260, 34, "查询", UI_A);
+}
+
+static void renderChat() {
+  if (gXzPageOpen) { renderXzBinding(); return; }
+  uiPage("小智问答", C_ORANGE_D);
+  bool mine = aiResFor(AVM_CHAT);
+  if (mine && gAiTranscript.length()) {
+    drawText(180, 74, "你", C_GREY, 16, 1, 1);
+    drawWrapText(gAiTranscript.c_str(), 180, 94, 264, 18, 2, C_CREAM, 16);
+  }
+  // 语音链路结果优先；串口 QWEN 命令的结果落在 gLastAnswer，也一并展示（无人工验收用）
+  const char *answer = (mine && gAiResult.length()) ? gAiResult.c_str()
+                     : (gLastAnswer.length() ? gLastAnswer.c_str() : nullptr);
+  if (answer) {
+    drawText(180, 132, "小智", C_ORANGE, 16, 1, 1);
+    drawWrapText(answer, 180, 152, 264, 20, 2, C_WHITE, 16);
+  }
+  if (!answer && !(mine && gAiTranscript.length())) {
+    drawText(180, 118, "点下方圆键说话", C_GREY, 16, 1, 1);
+    drawText(180, 144, "问一句小智答一句", COL(100, 112, 130), 16, 1, 1);
+  }
+  drawVoiceButton(180, 258, 46, "说话");
+  uiBtn(266, 258, 25, "绑定", UI_G);
+}
+
+static void renderWords() { if (wordPicking) renderWordPicker(); else wordRender(); }
+
+// ---------------- 语音备忘：语音 → 提取待办 → Todo ----------------
+static void renderMemo() {
+  uiPage("语音备忘", COL(90, 160, 130));
+  bool mine = aiResFor(AVM_MEMO);
+  if (mine && gAiTranscript.length()) {
+    drawText(180, 72, "记下", C_GREY, 16, 1, 1);
+    drawWrapText(gAiTranscript.c_str(), 180, 90, 264, 17, 2, C_CREAM, 16);
+  }
+  if (mine && gAiResult.length())
+    drawWrapText(gAiResult.c_str(), 180, 124, 252, 18, 2, COL(140, 230, 180), 16);
+  // 刚加进来的条目预览：让用户当场看到成果，而不只是一个数字
+  if (mine && gAiState != AVS_ERROR && gMemoLastAdded > 0 && gTodoNewFrom >= 0) {
+    int n = 0;
+    for (int i = gTodoNewFrom; i < gTodoN && n < 3; i++, n++) {
+      char line[40];
+      fitText(line, sizeof(line), gTodos[i].text, 16, 236);
+      drawText(180, 148 + n * 19, line, COL(170, 235, 200), 16, 1, 1);
+    }
+    if (gMemoLastAdded > 3) {
+      char more[24]; snprintf(more, sizeof(more), "还有 %d 条", gMemoLastAdded - 3);
+      drawText(180, 146 + 3 * 19, more, C_GREY, 16, 1, 1);
+    }
+  }
+  if (!mine) {
+    drawText(180, 118, "说出要做的事", C_GREY, 16, 1, 1);
+    drawText(180, 144, "自动记进待办清单", COL(100, 130, 115), 16, 1, 1);
+  }
+  drawVoiceButton(138, 250, 44, "录音");
+  uiBtn(242, 250, 36, gMemoBackToTodo ? "返回" : "清单", UI_G);
+}
+
+static void renderPet()   { petRender(); }
+
+// ---------------- 录音机：长录音 → AI 会议纪要 ----------------
+// ---------------- 录音机（v2.5）：录音 → TF 卡 → 回放；纪要可选 ----------------
+// 用户口径：录音机首先是录音机（录下来、能回放），文字纪要是**额外可选**的一步。
+// 所以停止录音不再自动跑 ASR，页面上三颗键：回放 / 录音 / 纪要。
+#define REC_ROWS 4
+static void renderRecList() {
+  clear(C_DARK2);
+  fillCircle(180, 180, 172, UI_PAGE_BG);
+  circle(180, 180, 168, COL(120, 96, 74), 2);
+  drawText(180, 34, "录音文件", C_CREAM, 16, 1, 1);
+  line(132, 60, 240, 60, UI_DIV);
+  char cnt[12]; snprintf(cnt, sizeof(cnt), "%d", gRecN);   // 只画数字：FONT16 中英混排会撞
+  drawText(180, 66, cnt, C_GREY, 16, 1, 1);
+  int pages = (gRecN + REC_ROWS - 1) / REC_ROWS; if (pages < 1) pages = 1;
+  if (gRecListPage >= pages) gRecListPage = pages - 1;
+  if (gRecN == 0) {
+    drawText(180, 150, "NO REC", C_GREY, 16, 1, 1);
+    drawText(180, 176, "先录一段", COL(120, 100, 86), 16, 1, 1);
+  }
+  for (int r = 0; r < REC_ROWS; r++) {
+    int idx = gRecListPage * REC_ROWS + r;
+    if (idx >= gRecN) break;
+    int y = 90 + r * 38;
+    bool sel = (idx == gRecSel);
+    fillRoundRect(66, y, 228, 32, 6, sel ? COL(70, 46, 34) : COL(28, 34, 42));
+    drawBtnText(78, y, 32, gRec[idx].name, sel ? C_YELLOW : C_WHITE, 16, 1, 0);
+    char s[12]; snprintf(s, sizeof(s), "%dS", (int)gRec[idx].secs);
+    drawBtnText(278, y, 32, s, C_GREY, 16, 1, 2);
+  }
+  char pg[12]; snprintf(pg, sizeof(pg), "%d/%d", gRecListPage + 1, pages);
+  drawText(180, 248, pg, C_GREY, 16, 1, 1);
+  uiBtn(112, 288, 26, "返回", UI_N);
+  uiBtn(248, 288, 26, "翻页", UI_N);
+}
+
+static bool recListTap(int x, int y);
+
+static void renderRecorder() {
+  // 第一次进这个页面先把卡里的录音列出来（进页面就走，不在 250ms 渲染里反复扫卡）
+  if (!gRecScanned) { recScan(); gRecScanned = (gRecN > 0) || tfEnsure(); }
+  if (gRecListOpen) { renderRecList(); return; }
+  uiPage("录音机", COL(160, 110, 80));
+  bool rec = gAiState == AVS_RECORDING && gAiRecToFile;
+  bool busy = gAiState == AVS_PROCESSING && gAiMode == AVM_MEETING;
+  bool play = recIsPlaying();
+
+  // ---- 状态行（y=74）：红点/三角 + 纯数字，中文另外一段画 ----
+  if (rec) {
+    uint32_t sec = (millis() - gAiRecStartMs) / 1000;
+    fillCircle(126, 84, 6, COL(238, 92, 80));
+    char t[12]; snprintf(t, sizeof(t), "%02u:%02u", (unsigned)(sec / 60), (unsigned)(sec % 60));
+    drawText(142, 74, t, COL(252, 158, 146), 16, 1, 0);
+    drawText(210, 74, "录音", COL(200, 120, 108), 16, 1, 0);
+  } else if (busy) {
+    drawText(180, 74, "纪要生成中", COL(250, 206, 120), 16, 1, 1);
+  } else if (play) {
+    fillTri(124, 74, 124, 92, 140, 83, COL(150, 210, 250));
+    // 分母用文件真实秒数：库里的 getAudioFileDuration 是截断值（10s 报 9s），
+    // 用它会跟左边"共 N 段"里的时长对不上，看着像掉了一秒
+    uint32_t dur = (gRecN > 0) ? gRec[gRecSel].secs : gAudDuration;
+    char t[24]; snprintf(t, sizeof(t), "%d/%d", (int)gAudElapsed, (int)dur);
+    drawText(150, 74, t, COL(180, 224, 252), 16, 1, 0);
+  } else {
+    drawText(180, 74, "就绪", COL(150, 132, 112), 16, 1, 1);
+  }
+
+  // ---- 电平条 / 进度条（y=106 高 10，x 116..244）----
+  if (rec) {
+    fillRoundRect(116, 106, 128, 10, 5, COL(40, 34, 30));
+    int lv = constrain(gAiRms / 8, 0, 100);
+    if (lv > 0) fillRoundRect(116, 106, 128 * lv / 100, 10, 5, COL(214, 96, 76));
+  } else if (play && gAudDuration > 0) {
+    fillRoundRect(116, 106, 128, 10, 5, COL(26, 34, 44));
+    int lv = constrain((int)gAudElapsed * 100 / (int)gAudDuration, 0, 100);
+    fillRoundRect(116, 106, 128 * lv / 100, 10, 5, COL(96, 160, 210));
+  }   // 空闲态不画空槽：一条深色横杠只会看成"没画完的进度条"
+
+  // ---- 当前选中这一段 ----
+  if (gRecN > 0) {
+    char nm[24];
+    snprintf(nm, sizeof(nm), "%s", gRec[gRecSel].name);
+    drawText(180, 132, nm, C_WHITE, 16, 1, 1);
+  } else {
+    drawText(180, 132, "还没有录音", COL(150, 132, 112), 16, 1, 1);
+  }
+  // 段数 / 存储（数字与中文分段：FONT16 下中文 16px、ASCII 只有 10px，混排必撞）
+  if (gRecMsg[0] && millis() > gRecMsgUntil) gRecMsg[0] = 0;   // 提示 3 秒后让位
+  if (gRecMsg[0]) {
+    drawText(180, 158, gRecMsg, COL(200, 176, 140), 16, 1, 1);
+  } else if (gRecN > 0) {
+    char n1[8]; snprintf(n1, sizeof(n1), "%d", gRecN);
+    int w1 = textWidth(n1, 16, 1);
+    int total = 16 + 6 + w1 + 6 + 16;          // 共 + N + 段
+    int x0 = 180 - total / 2;
+    drawText(x0, 158, "共", C_GREY, 16, 1, 0);
+    drawText(x0 + 22, 158, n1, C_CREAM, 16, 1, 0);
+    drawText(x0 + 22 + w1 + 6, 158, "段", C_GREY, 16, 1, 0);
+    drawText(180, 182, "点文件名打开列表", COL(120, 104, 90), 16, 1, 1);
+  } else {
+    drawText(180, 158, "点圆键开始录音", COL(120, 104, 90), 16, 1, 1);
+    drawText(180, 182, "存在 TF 卡 REC 目录", COL(96, 88, 80), 16, 1, 1);
+  }
+
+  // ---- 纪要（可选，点"纪要"键才生成） ----
+  if (gAiResult.length() && gAiResultOwner == AVM_MEETING) {
+    drawText(180, 204, gAiState == AVS_ERROR ? "识别状态" : "纪要", COL(230, 170, 120), 16, 1, 1);
+    drawWrapText(gAiResult.c_str(), 180, 222, 264, 18, 2, C_WHITE, 16);
+  }
+
+  // ---- 三颗键：回放 / 录音 / 纪要 ----
+  uiBtn(112, 292, 24, play ? "停止" : "回放", play ? UI_D : UI_G);
+  if (rec) uiBtn(180, 286, 34, "停止", UI_D, 24);
+  else uiBtn(180, 286, 34, "录音", busy ? UI_N : UI_A, 24);
+  uiBtn(248, 292, 24, "纪要", UI_S);
+}
+
+static bool recListTap(int x, int y) {
+  int pages = (gRecN + REC_ROWS - 1) / REC_ROWS; if (pages < 1) pages = 1;
+  if (hit(x, y, 112, 288, 34)) { gRecListOpen = false; render(); return true; }
+  if (hit(x, y, 248, 288, 34)) { gRecListPage = (gRecListPage + 1) % pages; render(); return true; }
+  for (int r = 0; r < REC_ROWS; r++) {
+    int ry = 90 + r * 38;
+    if (x >= 66 && x <= 294 && y >= ry && y <= ry + 32) {
+      int idx = gRecListPage * REC_ROWS + r;
+      if (idx < gRecN) {
+        gRecSel = idx;
+        gAiTranscript = ""; gAiResult = "";     // 换了一段，旧纪要作废
+        gRecListOpen = false;
+        recPlaySel();
+        render();
+      }
+      return true;
+    }
+  }
+  return true;
+}
+
+// ---------------- 待办清单：清单是唯一数据源，勾选 / 删除 / 翻页 / 清空 / 语音加 ----------------
+#define TODO_PER_PAGE 5
+static void renderTodo() {
+  uiPage("待办清单", COL(90, 150, 110));
+  int pages = (gTodoN + TODO_PER_PAGE - 1) / TODO_PER_PAGE;
+  if (pages < 1) pages = 1;
+  if (gTodoPage >= pages) gTodoPage = pages - 1;
+  // 中文 12px 会缺字（FONT12 无中文），数字与中文分段画
+  if (gTodoN == 0) {
+    drawText(180, 58, "空", C_GREY, 16, 1, 1);
+  } else {
+    char c1[12], c2[16];
+    snprintf(c1, sizeof(c1), "%d", gTodoN);
+    drawText(120, 58, c1, C_GREY, 16, 1, 0);
+    drawText(138, 58, "条", C_GREY, 16, 1, 0);
+    if (pages > 1) {
+      snprintf(c2, sizeof(c2), "%d/%d", gTodoPage + 1, pages);
+      drawText(166, 58, "第", C_GREY, 16, 1, 0);
+      drawText(184, 58, c2, C_YELLOW, 16, 1, 0);
+      drawText(228, 58, "页", C_GREY, 16, 1, 0);
+    }
+  }
+  line(110, 80, 250, 80, COL(50, 70, 58));
+  if (gTodoN == 0) {
+    drawText(180, 158, "还没有待办", C_GREY, 16, 1, 1);
+    drawText(180, 186, "点语音加说一条", COL(90, 120, 104), 16, 1, 1);
+  } else {
+    for (int k = 0; k < TODO_PER_PAGE; k++) {
+      int i = gTodoPage * TODO_PER_PAGE + k;
+      if (i >= gTodoN) break;
+      int ry = 92 + k * 31;
+      bool isNew = (gTodoNewFrom >= 0 && i >= gTodoNewFrom && gMemoLastAdded > 0);
+      uint16_t col = gTodos[i].done ? C_GREY : (isNew ? COL(170, 235, 200) : C_WHITE);
+      // 勾选框
+      rect(48, ry, 18, 18, gTodos[i].done ? C_GREEN : COL(90, 110, 100), 2);
+      if (gTodos[i].done) {
+        line(52, ry + 9, 57, ry + 14, C_GREEN, 2);
+        line(57, ry + 14, 63, ry + 4, C_GREEN, 2);
+      }
+      char txt[28];
+      fitText(txt, sizeof(txt), gTodos[i].text, 16, 128);
+      drawText(74, ry + 1, txt, col, 16, 1, 0);
+      // 期限短标签：今天/明天/N天后/逾期N天；点它可改期限
+      char dlLab[20]; uint16_t dlCol = C_GREY;
+      todoDeadlineLabel(gTodos[i].deadline, dlLab, sizeof(dlLab), dlCol);
+      drawText(210, ry + 2, dlLab, dlCol, 16, 1, 0);   // FONT12 无中文，必须 16
+      // 右侧删除圆键 ×
+      fillCircle(302, ry + 9, 12, COL(74, 40, 40));
+      circle(302, ry + 9, 12, COL(150, 80, 80), 1);
+      line(298, ry + 5, 306, ry + 13, COL(240, 170, 170), 2);
+      line(306, ry + 5, 298, ry + 13, COL(240, 170, 170), 2);
+    }
+  }
+  // 底键：语音加 / 翻页（多页时）/ 清空——统一 UI 组件。
+  // r30@(108/252,292) 外缘 163 越出安全区 158 → 上移到 y=285（外缘 157），
+  // 同时热区从 r+4 收到 r+2，保证手指落点仍在圆屏内。
+  uiBtn(108, 285, 30, "语音加", UI_G);
+  if (pages > 1) uiBtn(180, 285, 30, "下一页", UI_N);
+  bool armed = millis() < gTodoClearArmUntil;
+  uiBtn(252, 285, 30, armed ? "再点" : "清空", UI_D);
+}
+
+// ---------------- 期限快捷选择（清单子页） ----------------
+static void todoSetQuickDeadline(int days) {
+  if (gTodoDeadlineFor < 0 || gTodoDeadlineFor >= gTodoN) return;
+  time_t now = time(nullptr);
+  struct tm t; localtime_r(&now, &t);
+  t.tm_hour = 23; t.tm_min = 59; t.tm_sec = 0;
+  gTodos[gTodoDeadlineFor].deadline =
+    days < 0 ? 0 : (uint32_t)(mktime(&t) + (time_t)days * 86400L);
+  todoSave();
+}
+static void renderTodoDeadline() {
+  uiPage("设置期限", COL(90, 150, 110));
+  if (gTodoDeadlineFor < 0 || gTodoDeadlineFor >= gTodoN) return;
+  char preview[28];
+  fitText(preview, sizeof(preview), gTodos[gTodoDeadlineFor].text, 16, 232);
+  drawText(180, 76, preview, C_WHITE, 16, 1, 1);
+  char cur[20]; uint16_t cc = C_GREY;
+  todoDeadlineLabel(gTodos[gTodoDeadlineFor].deadline, cur, sizeof(cur), cc);
+  drawText(112, 104, "当前", cc, 16, 1, 0);
+  drawText(152, 104, cur, cc, 16, 1, 0);
+
+  // 五颗圆键：今天 / 明天 / 下周 / 下月 / 无期限
+  static const int DX[5] = {104, 180, 256, 142, 218};
+  static const int DY[5] = {158, 158, 158, 236, 236};
+  static const char *const DL[5] = {"今天", "明天", "下周", "下月", "无期限"};
+  static const int DD[5] = {0, 1, 7, 30, -1};
+  for (int i = 0; i < 5; i++) {
+    int st = (i == 4) ? UI_D : UI_N;   // 无期限=危险色；其余普通（当前项在下面另标）
+    uiBtn(DX[i], DY[i], 28, DL[i], st);
+  }
+  drawText(180, 290, "点心仪选项即可", C_GREY, 16, 1, 1);
+}
+
 // ================================================================ 渲染调度
 static void render() {
   if (gLocked) return;           // 息屏中：不画任何东西（背光已关，画了也看不见，白耗 CPU）
   switch (curPage) {
-    case P_ANALOG:   renderAnalog(); break;
-    case P_DIGITAL:  renderDigital(); break;
+    case P_ANALOG:   if (gFace) renderDigital(); else renderAnalog(); break;   // 主界面两块表盘
+    case P_DIGITAL:  renderDigital(); break;   // 串口 PAGE 1 保留（UI 上已并入主界面）
     case P_MUSIC:    renderMusic(); break;
     case P_RADAR:    renderRadar(); break;
     case P_POMO:     renderPomo(); break;
     case P_WIFI:     renderWifi(); break;
     case P_SETTINGS: gCityList ? renderCityList() : renderSettings(); break;
+    case P_APPS:     renderApps(); break;
+    case P_CHAT:     renderChat(); break;
+    case P_WORDS:    renderWords(); break;
+    case P_MEMO:     renderMemo(); break;
+    case P_PET:      renderPet(); break;
+    case P_RECORDER: renderRecorder(); break;
+    case P_TODO:     if (gTodoDeadlineFor >= 0) renderTodoDeadline(); else renderTodo(); break;
     default: break;
   }
   // v0.15：模拟表盘上的齿轮 / 锁键两个虚拟按钮全部去掉，表盘保持干净。
@@ -2312,6 +3007,32 @@ bool cfgExtra(const String &raw) {
     detailIdx = -1;
     render();
     Serial.printf("[UI] page -> %d\n", (int)curPage);
+    return true;
+  }
+  // v2.1 验收：主界面两块表盘互换。FACE 切一下；FACE 0 / FACE 1 直接指定。
+  if (up == "FACE" || up.startsWith("FACE ")) {
+    if (up.startsWith("FACE ")) {
+      gFace = raw.substring(5).toInt() ? 1 : 0;
+      cfgSetInt("face", gFace);
+      curPage = P_ANALOG;
+      render();
+    } else {
+      toggleClockFace();
+    }
+    Serial.printf("[CFG] face -> %s (page %d)\n", gFace ? "DIGITAL" : "ANALOG", (int)curPage);
+    return true;
+  }
+  // v2.2 验收：表盘语言。LANG 切一下；LANG 0 / LANG 1 直接指定（0=中文 1=English）。
+  if (up == "LANG" || up.startsWith("LANG ")) {
+    if (up.startsWith("LANG ")) {
+      gLang = raw.substring(5).toInt() ? 1 : 0;
+      cfgSetInt("lang", gLang);
+      curPage = P_ANALOG;
+      render();
+    } else {
+      toggleLang();
+    }
+    Serial.printf("[CFG] lang -> %s (page %d)\n", gLang ? "EN" : "CN", (int)curPage);
     return true;
   }
   // 验收/调试：强制星期（0=周日..6=周六），用于检查星期窗两种配色
@@ -2484,6 +3205,18 @@ bool cfgExtra(const String &raw) {
     Serial.printf("[CFG] select track %d\n", i + 1);
     return true;
   }
+  if (up == "PET" || up.startsWith("PETSET ")) { petCmd(raw); return true; }
+  if (up == "WORD" || up == "WORDRESET") { wordCmd(raw); return true; }
+  if (up == "MIC" || up == "MICPIN" || up.startsWith("MICTEST")) { micCmd(raw); return true; }
+  // 录音机验收：REC / RECLIST / RECREC [秒] / RECPLAY [n] / RECSTOP / RECMIN [n] / RECDEL [n]
+  if (up == "REC" || up == "RECLIST" || up.startsWith("RECREC") || up.startsWith("RECPLAY")
+      || up == "RECSTOP" || up.startsWith("RECMIN") || up.startsWith("RECDEL")) {
+    recCmd(raw); return true;
+  }
+  if (up.startsWith("BAILIAN") || up.startsWith("XZTOKEN") || up == "XZBIND" || up == "XZSTATUS"
+      || up.startsWith("TODO")
+      || up == "AI" || up.startsWith("QWEN ") || up == "ASRTODO"
+      || up.startsWith("NET") || up == "MEM" || up.startsWith("MODEL")) { cloudCmd(raw); return true; }
   if (up == "TFSCAN") { audioRescanTF(); Serial.println("[CFG] TF rescan queued"); return true; }
   if (up == "TFTEST") {
     audioTfTest();
@@ -2750,6 +3483,8 @@ bool cfgExtra(const String &raw) {
     Serial.printf("  Button    : GPIO%d=%d (BOOT, low=pressed)\n", BTN_PIN, digitalRead(BTN_PIN));
     Serial.printf("  Display   : bright=%d%%  volume=%d/21\n", gBright, gVolume);
     Serial.printf("  Page      : %d\n", (int)curPage);
+    Serial.printf("  Face      : %s (page %d)\n", gFace ? "DIGITAL" : "ANALOG", (int)curPage);
+    Serial.printf("  Lang      : %s\n", gLang ? "EN" : "CN");
     Serial.printf("  Provision : %s\n", gProvActive ? "AP 192.168.4.1" : "off");
     Serial.printf("  Uptime    : %lu s   reset=%d\n",
                   (unsigned long)(millis() / 1000), (int)esp_reset_reason());
@@ -2767,9 +3502,24 @@ static void handleTap(int x, int y) {
   if (curPage == P_SETTINGS) { settingsTap(x, y); return; }
   switch (curPage) {
     case P_ANALOG:
+      // v2.1：轴心 = **切换表盘**（模拟 / 数字）。进应用中心靠左右滑（和数字表盘同一套手势），
+      // 轴心不再承担"进应用"，两个动作互不干扰：点=换脸，滑=换层。
+      if (hit(x, y, 180, 180, 34)) { toggleClockFace(); return; }
+      if (gFace == 0) {
+        // 点 6 点天气副盘 = 立刻重拉真实天气
+        if (hit(x, y, 180, 248, 46)) {
+          lastWx = 0; showToast("WEATHER REFRESH");
+          Serial.println("[UI] weather refresh requested by tap");
+        }
+      } else {
+        // 数字表盘：没有副盘，点任意处即重拉天气（旧 P_DIGITAL 的行为原样保留）
+        lastWx = 0; showToast("WEATHER REFRESH");
+        Serial.println("[UI] weather refresh requested by tap");
+      }
+      break;
     case P_DIGITAL:
-      // v0.16：点天气区 = 立刻重拉真实天气。旧版在这里循环切换 7 条假天气，
-      // 是「天气到底是不是真的」这个疑问的主要来源，已彻底移除。
+      // 串口 PAGE 1 进来的数字表盘：同样点轴心换回模拟
+      if (hit(x, y, 180, 180, 34)) { toggleClockFace(); return; }
       lastWx = 0;
       showToast("WEATHER REFRESH");
       Serial.println("[UI] weather refresh requested by tap");
@@ -2873,6 +3623,133 @@ static void handleTap(int x, int y) {
       } else if (hit(x, y, 258, 264, 28)) {
         pomoNext(); pomo.alarm = false;
       }
+      break;
+    case P_APPS:
+      for (int i = 0; i < APP_N; i++) {
+        if (!hit(x, y, APP_X[i], APP_Y[i], APP_HIT_R)) continue;
+        if (APP_GLYPH[i] < 0) {                 // 预留位：只提示，不跳页
+          showToast("预留位 / 待扩充"); render(); return;
+        }
+        curPage = APP_PAGE[i];
+        if (curPage == P_SETTINGS) gSettingsFrom = P_APPS;
+        render(); return;
+      }
+      break;
+    case P_CHAT:
+      if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
+        if (gXzPageOpen) gXzPageOpen = false;
+        else curPage = P_APPS;
+        render(); return;
+      }
+      if (gXzPageOpen) {
+        auto state = gXzState.load();
+        if (hit(x, y, 180, 260, 36) && state != XzBinding::Waiting) xzRequestBinding();
+        render(); return;
+      }
+      if (hit(x, y, 266, 258, 29)) {
+        gXzPageOpen = true;
+        auto state = gXzState.load();
+        if (state != XzBinding::Waiting && state != XzBinding::Bound) xzRequestBinding();
+        render(); return;
+      }
+      if (hit(x, y, 180, 258, 54)) { aiVoiceToggle(AVM_CHAT); render(); }
+      break;
+    case P_MEMO:
+      if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
+        // 从待办页"语音加"进来的，返回时也回清单，闭环不迷路
+        bool fromTodo = gMemoBackToTodo;
+        gMemoBackToTodo = false;
+        curPage = fromTodo ? P_TODO : P_APPS; render(); return;
+      }
+      if (hit(x, y, 138, 250, 52)) { aiVoiceToggle(AVM_MEMO); render(); }
+      else if (hit(x, y, 242, 250, 42)) {
+        gMemoBackToTodo = false; curPage = P_TODO; gTodoPage = 0; render();
+      }
+      break;
+    case P_RECORDER:
+      if (gRecListOpen) { recListTap(x, y); return; }
+      if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
+        recStopPlay(); curPage = P_APPS; render(); return;
+      }
+      if (gAiState == AVS_PROCESSING) { showToast("纪要生成中"); break; }
+      if (hit(x, y, 180, 286, 42)) { recToggleRecord(); return; }
+      if (hit(x, y, 112, 292, 32)) { recTogglePlay(); render(); return; }
+      if (hit(x, y, 248, 292, 32)) { recMakeMinutes(); render(); return; }
+      // 点文件名那一行 = 打开录音列表（挑别的段来回放）
+      if (y >= 126 && y <= 176) { gRecListPage = gRecSel / REC_ROWS; gRecListOpen = true; render(); return; }
+      break;
+    case P_TODO: {
+      // 期限子页：返回键回清单，五颗圆键写期限
+      if (gTodoDeadlineFor >= 0) {
+        if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
+          gTodoDeadlineFor = -1; render(); return;
+        }
+        static const int DX[5] = {104, 180, 256, 142, 218};
+        static const int DY[5] = {158, 158, 158, 236, 236};
+        static const int DD[5] = {0, 1, 7, 30, -1};
+        for (int i = 0; i < 5; i++) {
+          if (hit(x, y, DX[i], DY[i], 34)) {
+            todoSetQuickDeadline(DD[i]);
+            gTodoDeadlineFor = -1;
+            showToast(DD[i] < 0 ? "已清除期限" : "期限已设置");
+            render(); return;
+          }
+        }
+        break;
+      }
+      if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
+        gMemoLastAdded = 0; gTodoNewFrom = -1;        // 离开清单，清掉"新"高亮
+        curPage = P_APPS; render(); return;
+      }
+      if (hit(x, y, 108, 285, 38)) {                   // 语音加：进备忘页，置闭环标志
+        if (gAiState == AVS_RECORDING || gAiState == AVS_PROCESSING) {
+          showToast("语音任务进行中"); render(); return;
+        }
+        gMemoBackToTodo = true; gMemoLastAdded = 0; gTodoNewFrom = -1;
+        gAiTranscript = ""; gAiResult = ""; gAiState = AVS_IDLE;
+        curPage = P_MEMO; render();
+      } else if (hit(x, y, 252, 285, 38)) {            // 清空：3s 内二次确认
+        if (gTodoN > 0 && millis() < gTodoClearArmUntil) {
+          gTodoN = 0; todoSave(); gTodoPage = 0; gTodoClearArmUntil = 0;
+          gMemoLastAdded = 0; gTodoNewFrom = -1; showToast("已清空");
+        } else if (gTodoN > 0) {
+          gTodoClearArmUntil = millis() + 3000; showToast("再点一次确认清空");
+        }
+        render();
+      } else if (gTodoN > 0) {
+        int pages = (gTodoN + TODO_PER_PAGE - 1) / TODO_PER_PAGE;
+        if (pages > 1 && hit(x, y, 180, 285, 38)) {    // 翻页
+          gTodoPage = (gTodoPage + 1) % pages; render();
+        } else {                                       // 条目行：左侧勾选 / 右侧删除
+          for (int k = 0; k < TODO_PER_PAGE; k++) {
+            int i = gTodoPage * TODO_PER_PAGE + k;
+            if (i >= gTodoN) break;
+            int ry = 92 + k * 31;
+            if (y >= ry - 2 && y <= ry + 20 && x >= 44 && x <= 320) {
+              if (x >= 288) { todoDel(i); }            // 右侧 × 区
+              else if (x >= 212) {                      // 期限标签区 → 进快捷选择
+                gTodoDeadlineFor = i; render(); return;
+              } else { todoToggle(i); }                // 左侧勾选区
+              gMemoLastAdded = 0; gTodoNewFrom = -1;   // 一操作就清高亮
+              if (gTodoPage >= (gTodoN + TODO_PER_PAGE - 1) / TODO_PER_PAGE && gTodoPage > 0)
+                gTodoPage--;                           // 末页删空则退回上一页
+              render(); return;
+            }
+          }
+        }
+      }
+      break;
+    }
+    case P_WORDS:
+      // 选词书子页的返回键由 wordTap 处理（回做题页），只有做题页才回应用中心
+      if (!wordPicking && hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
+        curPage = P_APPS; render(); return;
+      }
+      wordTap(x, y);
+      break;
+    case P_PET:
+      if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) { curPage = P_APPS; render(); return; }
+      petTap(x, y);
       break;
     case P_WIFI: {
       if (gWifiState == W_LIST) {
@@ -2985,11 +3862,6 @@ static bool isSettingsPull(const TouchEvent &ev) {
   return ev.type == TE_DOWN && ev.y <= PULL_START_Y &&
          ev.dy >= PULL_MIN_DY && (int)ev.dy * 2 > adx * 3;
 }
-static bool isSettingsPush(const TouchEvent &ev) {
-  int adx = ev.dx < 0 ? -ev.dx : ev.dx;
-  int ady = ev.dy < 0 ? -ev.dy : ev.dy;
-  return ev.type == TE_UP && ady >= 45 && ady > adx;
-}
 static void injectSwipe(int x1, int y1, int x2, int y2) {
   if (!gTouchQ) return;
   int dx = x2 - x1, dy = y2 - y1;
@@ -3009,17 +3881,27 @@ static void pollTouch() {
     if (gLocked) {
       continue;
     }
-    // 下拉呼出设置要放在曲库浮层分支之前，否则浮层会先把手势吃掉；
-    // 设置页里上推则回到刚才那一页，不必去找左上角的小 < 键。
-    if (curPage == P_SETTINGS && isSettingsPush(ev)) {
-      Serial.println("[UI] push up -> close settings");
-      exitSettings();
-      continue;
-    }
-    if (isSettingsPull(ev) && curPage != P_SETTINGS) {
+    // v2.0 导航：除表盘外所有入口都在应用中心里。
+    // 下拉呼出设置只在表盘上生效（应用里下拉 = 返回应用中心，别抢手势）。
+    if (isSettingsPull(ev) && curPage == P_ANALOG) {
       Serial.printf("[UI] pulldown -> settings (from page %d)\n", (int)curPage);
       enterSettings();
       continue;
+    }
+    // 子页/浮层优先关掉，再交给导航（一次滑动只做一件事，不会"跳过一层"）
+    if (ev.type != TE_TAP) {
+      if (curPage == P_TODO && gTodoDeadlineFor >= 0) {
+        gTodoDeadlineFor = -1; render(); continue;
+      }
+      if (curPage == P_SETTINGS && gCityList) {
+        gCityList = false; render(); continue;
+      }
+      if (curPage == P_RECORDER && gRecListOpen) {
+        gRecListOpen = false; render(); continue;
+      }
+      if (curPage == P_WORDS && wordPicking) {
+        wordPicking = false; render(); continue;
+      }
     }
     // 曲库浮层里滑动只翻曲目分组，不做十字翻页（和 Wi-Fi 列表滚动同一套约定）
     if (curPage == P_MUSIC && gMusicList && ev.type != TE_TAP) {
@@ -3039,25 +3921,23 @@ static void pollTouch() {
         break;
       case TE_UP:
         Serial.printf("[UI] swipe UP   d=%d,%d dt=%d page=%d\n", ev.dx, ev.dy, (int)ev.dt, curPage);
+        // Wi-Fi 列表里上滑 = 列表滚动（唯一的例外，手势让位给列表）
         if (curPage == P_WIFI && gWifiState == W_LIST) { wifiScrollBy(1); render(); }
-        else if (curPage == P_WIFI || curPage == P_SETTINGS) { /* 工具页不翻页 */ }
-        else if (navigate('U')) render();
+        else if (curPage == P_ANALOG) toggleClockFace();   // 表盘上滑 = 换表盘（上滑在本页无 home 可回）
+        else if (navigate('U')) render();       // 其余页面：上滑 = 回表盘（home）
         break;
       case TE_DOWN:
         Serial.printf("[UI] swipe DOWN d=%d,%d dt=%d page=%d\n", ev.dx, ev.dy, (int)ev.dt, curPage);
         if (curPage == P_WIFI && gWifiState == W_LIST) { wifiScrollBy(-1); render(); }
-        else if (curPage == P_WIFI || curPage == P_SETTINGS) { }
         else if (navigate('D')) render();
         break;
       case TE_LEFT:
         Serial.printf("[UI] swipe LEFT d=%d,%d dt=%d page=%d\n", ev.dx, ev.dy, (int)ev.dt, curPage);
-        if (curPage == P_WIFI || curPage == P_SETTINGS) { }
-        else if (navigate('L')) render();
+        if (navigate('L')) render();
         break;
       case TE_RIGHT:
         Serial.printf("[UI] swipe RIGHT d=%d,%d dt=%d page=%d\n", ev.dx, ev.dy, (int)ev.dt, curPage);
-        if (curPage == P_WIFI || curPage == P_SETTINGS) { }
-        else if (navigate('R')) render();
+        if (navigate('R')) render();
         break;
       default: break;
     }
@@ -3079,6 +3959,10 @@ void setup() {
   Serial.printf("Flash %u MB  PSRAM %u bytes  free heap %u\n",
                 ESP.getFlashChipSize() / 1048576, ESP.getPsramSize(), ESP.getFreeHeap());
   cfgLoad();                  // NVS 覆盖 config.h 默认值
+  cloudLoadCreds();           // 百炼凭据（必须在这里读，全局构造时 NVS 还没 init）
+  petInit();                  // v1.0 电子宠物：从 NVS 读回状态
+  wordInit();                 // v1.0 背单词：读回词书与进度
+  todoLoad();                 // v1.0 云端 AI：读回 Todo 清单
   // v0.16：天气/雷达城市（NVS city），默认上海；开机即生效，不用等网络
   gCityIdx = constrain(cfgGetInt("city", 0), 0, CITY_COUNT - 1);
   gHomeLat = CITIES[gCityIdx].lat;
@@ -3102,6 +3986,9 @@ void setup() {
   // 亮度 / 音量从 NVS 读回（设置页里改过的话掉电保留）
   gBright = cfgGetInt("bright", BACKLIGHT_LEVEL);
   gVolume = cfgGetInt("vol", 16);
+  gFace   = cfgGetInt("face", 0) ? 1 : 0;     // 主界面表盘：0 模拟 / 1 数字（NVS 记住上次选择）
+  gLang   = cfgGetInt("lang", 0) ? 1 : 0;     // 表盘语言：0 中文 / 1 English
+  Serial.printf("[UI] clock face = %s\n", gFace ? "DIGITAL" : "ANALOG");
   if (gBright < BRIGHT_MIN) gBright = BRIGHT_MIN;
   if (gBright > BRIGHT_MAX) gBright = BRIGHT_MAX;
   if (gVolume < 0) gVolume = 0;
@@ -3153,7 +4040,8 @@ void setup() {
   // v0.14：网络任务必须在 Core1。ESP32-audioI2S 的解码任务(优先级2)和我们
   // 的喂流任务(优先级3)都钉在 Core0；原来 netTask 也挤在 Core0，天气/航班的
   // HTTPS 长请求抢 lwIP/TLS 共享锁，直播流 read() 被卡 -> InBuffer 抽空即静音。
-  xTaskCreatePinnedToCore(netTask, "net", 16384, nullptr, 1, nullptr, 1);
+  if (xTaskCreatePinnedToCore(netTask, "net", 16384, nullptr, 1, nullptr, 1) != pdPASS)
+    Serial.println("[NET] task creation failed");
 }
 
 static uint32_t lastDraw = 0, lastFrame = 0;
@@ -3166,6 +4054,21 @@ void loop() {
   pomoTick();
   pollButton();               // 右上实体 BOOT 键：按一下 息屏 / 亮屏
   pollTouch();
+  cloudApplyJobs();           // 语音结果、待办存盘都由主循环处理
+  aiVoicePoll();              // 录音中：刷新电平条 + 20s 上限自动停
+  // 闭环：从待办页"语音加"进备忘，识别写入完成后自动回清单（录完即见成果）
+  if (gMemoBackToTodo && curPage == P_MEMO && gAiResultOwner == AVM_MEMO
+      && (gAiState == AVS_DONE || gAiState == AVS_ERROR)) {
+    gMemoBackToTodo = false;
+    curPage = P_TODO; gTodoPage = 0;
+    if (gAiState == AVS_DONE && gMemoLastAdded > 0) {
+      char tip[32]; snprintf(tip, sizeof(tip), "已加 %d 条待办", gMemoLastAdded);
+      showToast(tip);
+    } else if (gAiState == AVS_ERROR) {
+      showToast(gAiResult.length() ? gAiResult.c_str() : "识别失败");
+    }
+    render();
+  }
   cfgPoll();                  // 串口配置命令
   // 离开配网页后把 STA 自动重连还回去（扫描时为避开干扰临时掐掉过）
   if (gWifiStoppedReconnect && curPage != P_WIFI) {
@@ -3192,11 +4095,14 @@ void loop() {
   if (gLocked)                interval = 1000;              // 锁屏 1fps 刷新时间即可
   else if (curPage == P_WIFI) interval = 120;               // 配网页：扫描/键盘响应
   else if (curPage == P_SETTINGS) interval = 400;           // 设置页静态，慢刷即可
+  // 录音机：录音计时/回放进度要跟上（不录音不播放时也是 250ms 默认值，无需另设）
+  else if (curPage == P_RECORDER && gAiState == AVS_RECORDING) interval = 200;
   // 音乐页降到 ~8fps：黑胶转动仍可见，但 QSPI 全屏 DMA 次数减半，
   // 与 Core0 上的 I2S 音频通道互不干扰（旧 16fps 是 DMA 竞态的诱因之一）。
   else if (curPage == P_MUSIC) interval = 120;
   else if (curPage == P_RADAR) interval = 70;               // 扫描线 ~14 fps
   else if (curPage == P_POMO && pomo.running) interval = 200;
+  else if (gAiState == AVS_RECORDING) interval = 250;        // 录音：电平条 4fps
   // 息屏时 render() 直接返回、没有绘制耗时可让出 CPU，loop 会空转：
   // 主动让出 15ms（触摸/按键都在各自任务或轮询里，唤醒延迟无感）
   if (gLocked) { delay(15); return; }

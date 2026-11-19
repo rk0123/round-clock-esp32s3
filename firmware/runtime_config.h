@@ -66,13 +66,15 @@ static void cfgShow() {
   Serial.println("---- runtime config ----");
   Serial.printf("  WIFI_SSID   : %s\n", gCfg.ssid.c_str());
   Serial.printf("  WIFI_PASS   : %s\n", gCfg.pass.length() ? "********" : "(empty)");
-  Serial.printf("  CAIYUN_TOKEN: %s\n", gCfg.token.length() ? gCfg.token.c_str() : "(empty)");
+  Serial.printf("  CAIYUN_TOKEN: %s\n", gCfg.token.length() ? "SET" : "(empty)");
   Serial.printf("  BRIGHT      : %d %%   VOLUME: %d/21\n",
                 cfgGetInt("bright", BACKLIGHT_LEVEL), cfgGetInt("vol", 16));
   Serial.printf("  CITY        : %s  (%.5f, %.5f)   radar %d nm\n",
                 CITIES[gCityIdx].name, gHomeLat, gHomeLon, RADAR_RADIUS_NM);
   Serial.printf("  POMODORO    : focus %d min (presets 15 / 25 / 45)\n",
                 cfgGetInt("pomofocus", POMO_FOCUS_MIN));
+  Serial.printf("  CLOCK FACE  : %s (0=analog 1=digital)\n",
+                cfgGetInt("face", 0) ? "DIGITAL" : "ANALOG");
   Serial.printf("  refresh     : weather %lu min / adsb %lu s\n",
                 (unsigned long)(WX_REFRESH_MS / 60000UL), (unsigned long)(ADSB_REFRESH_MS / 1000UL));
   Serial.println("------------------------");
@@ -101,12 +103,18 @@ static void cfgHandle(const String &raw) {
     Serial.println("Time:     RTC (PCF85063 @0x51 raw 0x04..0x0A + usable?) | SETTIME 2026-11-15 23:30[:00]");
     Serial.println("          RTCD <reg> [len] / RTCW <reg> <b0> [b1..] (raw register peek/poke, hex)");
     Serial.println("          NTP is only used when online (~every 3 h); offline boot uses RTC, else last NVS time");
-    Serial.println("          PAGE <0..6> | SHOT (dump 360x360 RGB565 framebuffer) | WDAY <0..6> (force weekday)");
+    Serial.println("          PAGE <0..13> | SHOT (dump 360x360 RGB565 framebuffer) | WDAY <0..6> (force weekday)");
+    Serial.println("          FACE [0|1] (home clock: 0 analog / 1 digital; also settings FACE card)");
+    Serial.println("          LANG [0|1] (digital face text: 0 中文 / 1 English; also settings LANG card)");
     Serial.println("          LOCK (screen off / on) | BTN (inject a BOOT-button press: only way to WAKE)");
     Serial.println("          Pomodoro: POMO <15|25|45> (focus preset; touch ignored while locked)");
     Serial.println("          TAP <x> <y> (inject a tap) | SWIPE <x1> <y1> <x2> <y2> (inject a swipe)");
-    Serial.println("Gesture:  pull DOWN from upper half -> settings on ANY page; push UP in settings -> back");
-    Serial.println("No Wi-Fi saved? Use the on-device WIFI icon (tap) or serial WIFI. AP command still works.");
+    Serial.println("          MIC (state) | MICTEST [1..20] (record N s: samples/peak/rms) | MICPIN (pin edge diag)");
+    Serial.println("Cloud:    BAILIAN [key] | QWEN <text> | AI | AICANCEL | ASRTODO | XZBIND | XZSTATUS");
+    Serial.println("Gesture:  swipe LEFT/RIGHT on home -> app grid; swipe UP on any app -> home");
+    Serial.println("          home shows ONLY the face picked in Settings (FACE card), not both");
+    Serial.println("          pull DOWN from upper half -> settings on ANY page; push UP in settings -> back");
+    Serial.println("No Wi-Fi saved? Settings page (app grid) -> first row WIFI, or serial WIFI. AP command still works.");
     Serial.println("Config changes take effect after REBOOT (or power cycle).");
   } else if (up == "SHOW") {
     cfgShow();

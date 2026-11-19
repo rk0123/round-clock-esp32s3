@@ -17,7 +17,7 @@ import time
 import re
 from capture_frame import open_port
 
-PY = sys.executable  # 直接用当前解释器，换机器不用改
+PY = "C:/Users/rk/AppData/Local/Programs/Python/Python310/python.exe"  # 仅文档用
 
 
 def main():

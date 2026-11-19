@@ -1,0 +1,6 @@
+# Local additions for RoundClock phase 2. Arduino ESP32 core merges this with boards.txt.
+# Install: copy this file to <Arduino15>/packages/esp32/hardware/esp32/3.0.7/
+# and app5M_fat7M_16MB.csv to <that>/tools/partitions/
+esp32s3.menu.PartitionScheme.app5M_fat7M_16MB=16M Flash (5MB APP/6MB FATFS)
+esp32s3.menu.PartitionScheme.app5M_fat7M_16MB.build.partitions=app5M_fat7M_16MB
+esp32s3.menu.PartitionScheme.app5M_fat7M_16MB.upload.maximum_size=5242880

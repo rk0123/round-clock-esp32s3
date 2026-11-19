@@ -875,3 +875,70 @@ firmware/
   暂停时 `gain=0 mute=YES` 且字节数冻结），但本环境无法代替人耳确认音质与音量。
 - 彩云天气需自带 token；不填时依次走 Open-Meteo → MET Norway，界面状态栏显示实际来源
   （`CAIYUN` / `OPENMETEO` / `METNO`）。三条都失败才退回 `DEMO`。
+
+---
+
+## 10. v2.x 结构变更摘要（本节之后的内容取代前面部分描述）
+
+前面的章节写到 v0.27，那时的形态是「七页环形翻页 + 十字手势」。v2.0 做了大改，这里只记录**结论**，
+细节见 [`../docs/firmware-integration.md`](../docs/firmware-integration.md) 与顶层 README。
+
+### 10.1 导航从"七页环"改成"三层"
+
+```
+表盘  ←──→  应用中心  ←──→  某个应用
+ ↑                                │
+ └──────── 任意应用上滑回表盘 ────┘
+```
+
+- `PAGE_RING` / `ringStep` / 十字翻页全部删除，`navigate(dir)` 只剩下三条规则。
+- `P_APPS = 7` 的应用中心是 **10 格正三角形**（1+2+3+4），设置坐顶点；`APP_GLYPH[]` 把格位与图标解耦，
+  `-1` 是预留位（虚线环 r28 + 淡十字）。
+- 表盘变成一块页两种脸（`gFace`，NVS `rcfg/face`）：点轴心 r≤34 或上滑换脸，左右滑进应用中心。
+- 页面编号 `P_APPS=7 … P_TODO=13`，串口 `PAGE n` 语义不变。
+
+### 10.2 新增模块
+
+| 文件 | 职责 |
+|---|---|
+| `ai_cloud.h` | 百炼 Paraformer 实时 ASR / Qwen 文本问答 / 待办提取。所有 HTTPS 在 `netTask`（16 KB 栈）执行，结果回主循环落盘重绘 |
+| `xiaozhi_binding.h` | 设备绑定：POST `api.tenclass.net/xiaozhi/ota/`，带 eFuse HMAC 证明，拿回 `websocket.url/token` |
+| `xiaozhi_client.h` | 小智会话：完整 WS 客户端（随机 nonce、`Sec-WebSocket-Accept` 校验、分片重组、ping/pong、每帧 deadline），Opus 双向编解码，本地 VAD 断句，连续对话 |
+| `mic_recorder.h` | ES7210 采音。`micBegin(gain, capacity)` 一次性模式 + 流式环形缓冲模式，两套共用同一个 I²S RX |
+| `recorder.h` | TF 卡 WAV 录音机：`/REC/RECxxxx.WAV`，16k/16bit/mono，44 字节 RIFF 头，60 s 上限 |
+| `secure_http.h` | `cloudUseCaBundle()` + `BoundedHttpBody`：给每个响应设字节上限，防止上游无 `Content-Length` 时无限累积 |
+| `src/opus/` | vendored libopus 1.3.1 定点版（编 + 解），由 `tools/vendor_opus.py` 从上游 tarball 生成 |
+
+### 10.3 内存必须重排
+
+三张曲库表（`gRadio/gTf/gPod`，各 40×448 B）原来在 `.bss`，合计 52.5 KB 内部 RAM。
+小智会话要同时吃 TLS（两块 16 KB 连续堆）+ ES7210 RX DMA 环，一开就爆，LCD 直接
+`spi transmit (queue) color failed`。v2.7 改为 `ps_malloc` 上 PSRAM：
+
+**内部静态内存 131,208 B → 77,472 B**，空闲内部堆从 77 KB 回到 148 KB，会话中仍有 80 KB 余量。
+
+同时 RX 的 DMA 从默认 6×240 帧降到 4×160 帧（≈2.5 KB，省 3 KB）；
+触摸与采音任务栈压到 4 KB（它们都不碰 TLS）。
+
+### 10.4 采样率被播放侧锁死
+
+ES8311 与 ES7210 共用 BCLK/LRCK，所以 **I²S 全局只能有一个采样率，选 48 kHz**：
+
+- 录音：48 k 收 → 3 点均值降采样 → 16 k（`48000/3 = 16000` 精确整除）
+- 小智上行：16 k Opus，60 ms 一帧（960 样本）
+- 小智下行：24 k Opus → 线插值 ×2 → 48 k
+- **TX/RX 都是 16 bit 立体声**，单声道数据必须左右各写一份，否则音调掉八度
+
+### 10.5 v2.7 验收记录（真机 COM12）
+
+```
+[XZ] hello sid=eb7b367e rate=24000
+[XZ] rx [stt] {"text":"我。"}
+[XZ] rx [tts] {"state":"sentence_start","text":"怎么啦，就一个字，我在听喔。"}
+[XZ] audio #1 dec=1440 out=5760 wrote=5760
+[XZ] answer finished=1 speaking=1 audio pkt=63 frames=181440
+[XZ] listen start …                     ← TTS 播完自动进下一轮
+```
+
+连续多轮稳定，`spi transmit` 错误 0，无 assert、无栈溢出。
+用合成音通道 `XZTEST` 代替麦克风验证（只证明链路与下行出声，不证明真人识别率）。

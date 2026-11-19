@@ -35,6 +35,8 @@
 #include <FFat.h>
 #include <SD_MMC.h>
 #include <Preferences.h>
+#include <atomic>
+#include <freertos/semphr.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <math.h>
@@ -42,7 +44,7 @@
 #include "Audio.h"
 #include "es8311.h"
 
-extern bool wifiOK;
+extern std::atomic<bool> wifiOK;
 
 // ------------------------------------------------------------------ 回调日志
 static uint32_t gLastAudioLog = 0;
@@ -79,13 +81,13 @@ void audio_eof_stream(const char *info)  { Serial.printf("[AUD.i] stream eof: %s
 #define I2S_DOUT_PIN   47
 #define I2S_MCLK_PIN    2
 #define PA_EN_PIN       9
-#define AUDIO_SR    44100
+#define AUDIO_SR    48000
 
 // ------------------------------------------------------------------ 音源模型
 enum AudSrc : uint8_t { AS_RADIO = 0, AS_TF = 1, AS_POD = 2, AS_COUNT = 3 };
 // v0.16：TF 卡栏目按用户要求改名 MUSIC；中文栏目名在 UI 的 tab 上单独用 16px 字库绘制
 static const char *const AUD_SRC_NAME[] = {"RADIO", "MUSIC", "PODCAST"};
-#define AUD_MAX_TRACKS 20
+#define AUD_MAX_TRACKS 40   // v1.0：电台扩到 33 条（原来 20 装不下）
 #define AUD_NAME_LEN   64       // v0.16 40->64：中文标题是 3 字节/字，40 字节只能装 13 个字
 #define AUD_URL_LEN   384
 #define AUD_FEED_LEN  256
@@ -116,41 +118,22 @@ static int gPodFeedIdx = 0;
 
 struct AudTrack { char name[AUD_NAME_LEN]; char url[AUD_URL_LEN]; };
 
-// 12 条直链均经 PC 实测 200 / audio/mpeg（2026-11-15）。
-// 前 6 条走国内蜻蜓 CDN，连接快；后 6 条是国际台，TLS 握手慢，排在后面作备用。
-// 注意：SomaFM 会按 User-Agent 拒流，库用的是 VLC/3.0.21 UA，实测可通。
-static const char *const STREAM_URLS[] = {
-  "https://lhttp.qtfm.cn/live/15318317/64k.mp3",
-  "https://lhttp.qtfm.cn/live/4915/64k.mp3",
-  "https://lhttp.qtfm.cn/live/4804/64k.mp3",
-  "https://lhttp.qtfm.cn/live/1301/64k.mp3",
-  "https://lhttp.qtfm.cn/live/1136/64k.mp3",
-  "https://lhttp.qtfm.cn/live/1122/64k.mp3",
-  "https://rfienchinois64k.ice.infomaniak.ch/rfienchinois-64.mp3",
-  "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service",
-  "https://icecast.omroep.nl/radio1-bb-mp3",
-  "https://streams.kqed.org/kqedradio",
-  "https://ice1.somafm.com/groovesalad-128-mp3",
-  "https://ice1.somafm.com/dronezone-128-mp3"
-};
-// v0.16：中文电台名（16px 全量字库，任意汉字都能显示）。
-// 前 6 条是蜻蜓 CDN 的流 ID，服务端不返回 icy-name，故按频道序号如实标注，不虚构台名。
-static const char *const STREAM_LABELS[] = {
-  "蜻蜓FM 频道一", "蜻蜓FM 频道二", "蜻蜓FM 频道三",
-  "蜻蜓FM 频道四", "蜻蜓FM 频道五", "蜻蜓FM 频道六",
-  "法国国际广播 华语", "BBC 世界广播", "荷兰 NPO 一台",
-  "KQED 公共广播", "SomaFM 律动", "SomaFM 氛围"
-};
-#define STREAM_COUNT 12
+// v1.0：电台表移到独立头文件，33 条直链均经 PC 实测（2026-11-17）。
+// 国内 8 条蜻蜓 CDN + 国外 25 条；中央台与地方台多为 HLS 分片，暂不能直连。
+#include "radio_stations_v2.h"
 
 // 兼容旧 UI 变量名：gStation 只表示「电台」下标
 static int gStation = 0;
-static AudTrack gRadio[AUD_MAX_TRACKS];
+// ⚠ 三张曲库表（3 × 40 × 448B = 52.5KB）原来躺在内部 RAM 的 .bss 里。
+// 小智语音会话要同时占 TLS 记录缓冲(32KB) + ES7210 RX DMA(17KB)，内部 RAM 一紧
+// LCD 的 QSPI 刷屏就直接 "spi transmit (queue) color failed" → 屏幕卡死。
+// 改成 PSRAM 里的指针数组，语法上 gRadio[i] 照旧可用。
+static AudTrack *gRadio = nullptr;
 static int      gRadioN = STREAM_COUNT;
-static AudTrack gTf[AUD_MAX_TRACKS];
+static AudTrack *gTf = nullptr;
 static volatile int  gTfN = 0;
 static bool          gTfMounted = false;
-static AudTrack gPod[AUD_MAX_TRACKS];
+static AudTrack *gPod = nullptr;
 static volatile int  gPodN = 0;
 static volatile AudSrc gSrc = AS_RADIO;
 static volatile int    gIdx = 0;
@@ -159,7 +142,7 @@ static volatile bool   gPodBusy = false;
 // ------------------------------------------------------------------ 运行时状态
 static Audio           *gAudio      = nullptr;
 static es8311_handle_t  gCodec      = nullptr;
-static bool             gAudioReady = false;
+static std::atomic<bool> gAudioReady{false};
 static bool             gConnected  = false;
 enum AudioState : uint8_t { A_IDLE = 0, A_CONNECTING, A_PLAYING, A_PAUSED, A_ERROR };
 static volatile AudioState gAudioState = A_IDLE;
@@ -183,11 +166,15 @@ static uint32_t gAudConnectGraceMs = 15000;  // 播客重定向链长，连接�
 static bool     gMuteApplied = false;        // 暂停/停止时数字静音，杜绝 DMA 回放最后一帧
 static volatile bool gVolDirty = false;
 static bool     gToneMode     = false;  // TONE 是离线自测，播完必须停，不能当电台重连
+// v2.7 小智：解码出来的 PCM 直接写 I2S0 的 TX 句柄（不经库的播放器）。
+// 这段期间播放器必须是 IDLE，并且不能被「空闲静音」把 codec 音量清零。
+static std::atomic<bool> gExtPcmOn{false};
 
 // ------------------------------------------------------------------ 请求队列
 enum : uint8_t {
   AQ_NONE = 0, AQ_PLAY, AQ_TOGGLE, AQ_NEXT, AQ_STOP, AQ_TONE, AQ_VOL,
-  AQ_SOURCE, AQ_SELECT, AQ_RESCAN_TF, AQ_PODFEED, AQ_PODADD, AQ_PODCLEAR, AQ_TFTEST
+  AQ_SOURCE, AQ_SELECT, AQ_RESCAN_TF, AQ_PODFEED, AQ_PODADD, AQ_PODCLEAR, AQ_TFTEST,
+  AQ_PLAYFILE            // 播一条指定路径的本地音频（录音回放用，text = 完整路径）
 };
 struct AudCmd {
   uint8_t cmd; int arg; int arg2;
@@ -302,7 +289,24 @@ static int audCount(AudSrc s) {
 }
 
 // ------------------------------------------------------------------ TF 卡
+static SemaphoreHandle_t gTfMutex = nullptr;
+static unsigned gTfTransfers = 0;
+
+class TfLock {
+ public:
+  TfLock() : locked(gTfMutex && xSemaphoreTakeRecursive(gTfMutex, portMAX_DELAY) == pdTRUE) {}
+  ~TfLock() { if (locked) xSemaphoreGiveRecursive(gTfMutex); }
+  explicit operator bool() const { return locked; }
+  TfLock(const TfLock &) = delete;
+  TfLock &operator=(const TfLock &) = delete;
+
+ private:
+  bool locked;
+};
+
 static bool tfEnsure() {
+  TfLock lock;
+  if (!lock) return false;
   if (gTfMounted) return true;
   // 官方 4-bit 引脚；失败再退 1-bit（只用 CLK/CMD/D0）
   SD_MMC.setPins(15, 14, 16, 17, 12, 13);
@@ -317,6 +321,27 @@ static bool tfEnsure() {
   gTfMounted = false;
   return false;
 }
+// 持有文件期间阻止另一个任务重挂载 TF 卡。
+class TfTransfer {
+ public:
+  TfTransfer() {
+    TfLock lock;
+    active = lock && tfEnsure();
+    if (active) ++gTfTransfers;
+  }
+  ~TfTransfer() {
+    if (!active) return;
+    TfLock lock;
+    if (lock) --gTfTransfers;
+  }
+  explicit operator bool() const { return active; }
+  TfTransfer(const TfTransfer &) = delete;
+  TfTransfer &operator=(const TfTransfer &) = delete;
+
+ private:
+  bool active = false;
+};
+
 static bool tfIsAudio(const String &n) {
   String l = n; l.toLowerCase();
   return l.endsWith(".mp3") || l.endsWith(".wav") || l.endsWith(".m4a") ||
@@ -361,6 +386,8 @@ static void tfScanDir(const char *dir, int depth) {
   d.close();
 }
 static void tfScan() {
+  TfLock lock;
+  if (!lock || gTfTransfers) { Serial.println("[TF] card busy"); return; }
   gTfN = 0; gTfDirs = 0; gTfFiles = 0;
   // 热插拔换卡后强制重新枚举；调用方（AQ_RESCAN_TF / AQ_TFTEST）已先 stopSong()
   SD_MMC.end();
@@ -594,8 +621,25 @@ static void audMonitor();
 static void audNext(int dir);
 
 // ------------------------------------------------------------------ 播放动作
+// 采音启用 RX 前，由音频任务确认共享 I²S 的播放已经停止。
+static std::atomic<uint32_t> gCaptureTicket{0}, gCaptureAccepted{0};
+static std::atomic<bool> gCaptureRequested{false};
+
+static bool audioBeginCapture() {
+  const uint32_t ticket = gCaptureTicket.fetch_add(1) + 1;
+  gCaptureRequested.store(true);
+  const uint32_t start = millis();
+  while (gCaptureAccepted.load() != ticket && millis() - start < 450) delay(2);
+  if (gCaptureAccepted.load() == ticket) return true;
+  gCaptureRequested.store(false);
+  Serial.println("[AUD] capture waiting for player stop timed out");
+  return false;
+}
+
+static void audioEndCapture() { gCaptureRequested.store(false); }
+
 static bool audStart(int idx) {
-  if (!gAudioReady) return false;
+  if (gCaptureRequested.load() || !gAudioReady) return false;
   AudTrack *t = audTrackAt(gSrc, idx);
   if (!t) return false;
   gIdx = idx;
@@ -755,6 +799,10 @@ static void audMonitor() {
 // ------------------------------------------------------------------ 命令执行
 static void audExec(const AudCmd &c) {
   if (!gAudioReady) return;
+  if (gCaptureRequested.load() && c.cmd != AQ_STOP && c.cmd != AQ_VOL) {
+    Serial.printf("[AUD] command %u skipped while recording\n", c.cmd);
+    return;
+  }
   switch (c.cmd) {
     case AQ_PLAY:    gAudRetry = 0; audStart(c.arg >= 0 ? c.arg : gIdx); break;
     case AQ_SELECT:  gAudRetry = 0; audStart(c.arg); break;
@@ -821,6 +869,24 @@ static void audExec(const AudCmd &c) {
       gPodN = 0; podSave(); gIdx = 0;
       Serial.println("[POD] list cleared");
       break;
+    // ---- 录音回放：播一条指定路径的本地文件 ----
+    // 与 audStart(AS_TF) 的区别：路径不在 gTf[] 里（录音目录不进曲库），且**播完就停**
+    // （gToneMode=true 走"本地文件"分支），不会自动续播下一首、也不会当电台重连。
+    case AQ_PLAYFILE: {
+      if (!c.text[0]) break;
+      if (!tfEnsure()) { gAudioState = A_ERROR; Serial.println("[REC] TF not available"); break; }
+      gAudio->stopSong();
+      vTaskDelay(pdMS_TO_TICKS(60));      // 让上一条 socket/DMA 收尾，和 audStart 同款规避
+      bool ok = gAudio->connecttoFS(SD_MMC, c.text);
+      gAudioState = ok ? A_CONNECTING : A_ERROR;
+      gToneMode = true;
+      gAudStartMs = millis(); gAudLastData = millis();
+      gAudLastBuf = 0xFFFFFFFF;
+      gAudLastI2s = gI2sDiag[3]; gAudStartI2s = gI2sDiag[3];
+      gAudRetryAt = 0; gAudRetry = 0;
+      Serial.printf("[REC] playfile '%s' -> %s\n", c.text, ok ? "OK" : "FAILED");
+      break;
+    }
     case AQ_TFTEST:
       if (gAudioReady) { gAudio->stopSong(); gAudioState = A_IDLE; }
       // arg=1 写一个中文文件名，用来端到端验收「TF 卡中文歌名」链路
@@ -846,11 +912,16 @@ static void audioTask(void *) {
     // 旧值 (3000,2000) 让直播流一次 chunk 间隔 >2s 就被误判断连。
     gAudio->setConnectionTimeout(8000, 8000);
     gAudioReady = true;
-    Serial.println("[AUD] Audio/I2S initialized on Core0 (codec 44.1k -> lib resamples 48k)");
+    Serial.println("[AUD] Audio/I2S initialized on Core0 (48 kHz shared with ES7210)");
   } else {
     Serial.println("[AUD] Audio alloc FAILED");
   }
   for (;;) {
+    const uint32_t ticket = gCaptureTicket.load();
+    if (gCaptureRequested.load() && gCaptureAccepted.load() != ticket) {
+      audStop();
+      gCaptureAccepted.store(ticket);
+    }
     AudCmd c;
     int budget = 4;
     while (budget-- && xQueueReceive(gAudQ, &c, 0) == pdTRUE) audExec(c);
@@ -863,7 +934,9 @@ static void audioTask(void *) {
     // pauseResume() 只让库停止喂数据，I2S/GDMA 仍在跑；auto_clear=true 会发零，
     // 但再叠一层数字静音最保险，彻底杜绝「暂停后一直重复同一个音」。
     // 集中在这里按状态同步，TOGGLE / STOP / SOURCE / VOL 各路径都不会漏。
-    bool wantMute = (gAudioState == A_PAUSED || gAudioState == A_IDLE || gAudioState == A_ERROR);
+    // 小智直写 PCM 期间（gExtPcmOn）不能按 IDLE 清零 —— 那会把我们自己的话音掐掉。
+    bool wantMute = (gAudioState == A_PAUSED || gAudioState == A_IDLE || gAudioState == A_ERROR) &&
+                    !gExtPcmOn.load();
     if (gAudioReady && (wantMute != gMuteApplied || gVolDirty)) {
       gAudio->setVolume(wantMute ? 0 : (uint8_t)gAudioVol);
       gMuteApplied = wantMute;
@@ -898,6 +971,29 @@ static int  audioPodFeedIndex()           { return gPodFeedIdx; }
 static const char *audioPodFeedName()     { return POD_FEEDS[gPodFeedIdx].name; }
 static void audioPodAdd(const char *name, const char *url) { audSend(AQ_PODADD, 0, 0, url, name); }
 static void audioPodClear()               { audSend(AQ_PODCLEAR); }
+
+// ------------------------------------------------------------------ 小智 PCM 输出（v2.7）
+// 走库已经建好的 I2S0 TX 句柄：播放器必须先停（同一组 DMA 描述符），
+// 之后我们按 20~60ms 一块直写，i2s_channel_write 自己按 DMA 速率阻塞 = 天然实时。
+static i2s_chan_handle_t audioTxHandle() {
+  return (gAudioReady && gAudio) ? gAudio->getTxHandle() : nullptr;
+}
+static void audioPcmBegin() { audSend(AQ_STOP); gExtPcmOn.store(true); gVolDirty = true; }
+static void audioPcmEnd()   { gExtPcmOn.store(false); }
+static int audioPcmWrite(const int16_t *pcm, int count, uint32_t timeoutMs) {
+  i2s_chan_handle_t tx = audioTxHandle();
+  if (!tx || count <= 0) return -1;
+  size_t written = 0;
+  esp_err_t e = i2s_channel_write(tx, pcm, (size_t)count * sizeof(int16_t), &written, timeoutMs);
+  // 库的析构 / setI2SCommFMT_LSB 会把 TX 通道 disable 掉（stopSong 不会）。
+  // 万一在别的路径上被关了，这里重开一次，别让小智突然哑掉。
+  if (e == ESP_ERR_INVALID_STATE) {
+    i2s_channel_enable(tx);
+    written = 0;
+    e = i2s_channel_write(tx, pcm, (size_t)count * sizeof(int16_t), &written, timeoutMs);
+  }
+  return e == ESP_OK ? (int)(written / sizeof(int16_t)) : -1;
+}
 
 static AudSrc  audioSource()       { return gSrc; }
 static int     audioIndex()        { return gIdx; }
@@ -943,7 +1039,25 @@ static void audioStatusDump() {
 }
 
 // ------------------------------------------------------------------ 初始化
+// 三张曲库表放 PSRAM：内部 RAM 要留给 TLS 和 LCD 的 DMA
+static bool audTracksAlloc() {
+  if (gRadio && gTf && gPod) return true;
+  const size_t bytes = sizeof(AudTrack) * AUD_MAX_TRACKS;
+  auto take = [bytes](AudTrack *&slot) {
+    if (slot) return;
+    slot = (AudTrack *)ps_malloc(bytes);
+    if (!slot) slot = (AudTrack *)malloc(bytes);     // 没 PSRAM 的板子兜底
+    if (slot) memset(slot, 0, bytes);
+  };
+  take(gRadio); take(gTf); take(gPod);
+  const bool ok = gRadio && gTf && gPod;
+  Serial.printf("[AUD] track tables %s (3 x %uB, psram)\n", ok ? "OK" : "FAILED", (unsigned)bytes);
+  return ok;
+}
+
 static bool audioInit() {
+  gTfMutex = xSemaphoreCreateRecursiveMutex();
+  if (!audTracksAlloc()) return false;
   for (int i = 0; i < STREAM_COUNT; i++) {
     strncpy(gRadio[i].name, STREAM_LABELS[i], sizeof(gRadio[i].name) - 1);
     strncpy(gRadio[i].url,  STREAM_URLS[i],  sizeof(gRadio[i].url) - 1);

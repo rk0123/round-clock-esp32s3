@@ -26,12 +26,17 @@ struct RecItem {
   uint32_t number;
   uint32_t bytes;
   uint32_t secs;
+  bool     minutes;                  // 同名 .TXT 纪要是否存在（v2.9）
 };
 
 static RecItem gRec[REC_MAX];
 static int  gRecN        = 0;        // 有效条数（新的在前）
 static int  gRecSel      = 0;        // 当前选中下标
 static bool gRecListOpen = false;    // 录音列表子页
+static bool gMinuteOpen  = false;    // 纪要阅读子页（v2.9）
+static int  gMinutePage  = 0;
+static String gMinuteText;           // 当前阅读的纪要全文（主循环里用，最大几十 KB 无压力）
+static uint32_t gRecConfirmUntil = 0; // 删除二次确认窗口（点一次变"确认"，再点才删）
 static bool gRecScanned  = false;    // 进过录音页并成功枚举过一次卡里的录音
 static int  gRecListPage = 0;
 static bool gRecPlaying  = false;    // 本次播放是"回放录音"（不是电台/曲库）
@@ -86,8 +91,11 @@ static uint32_t recScan() {
     item.number = number;
     item.bytes = file.size();
     item.secs = item.bytes > 44 ? (item.bytes - 44) / REC_BYTES_SEC : 0;
+    char mp[REC_PATH_SIZE];
+    snprintf(mp, sizeof(mp), REC_DIR "/%.*s.TXT", (int)(len - 4), name);
+    item.minutes = SD_MMC.exists(mp);
   }
-  if (gRecSel >= gRecN) gRecSel = 0;
+  if (gRecSel >= gRecN) { gRecSel = 0; gMinuteOpen = false; gMinuteText = ""; }
   return maxNumber;
 }
 
@@ -95,6 +103,75 @@ static const char *recPathOf(int idx, char *buf, size_t cap) {
   if (idx < 0 || idx >= gRecN) { buf[0] = 0; return buf; }
   snprintf(buf, cap, REC_DIR "/%s", gRec[idx].name);
   return buf;
+}
+
+// ---------------- 纪要（v2.9）：与 WAV 同编号的 /REC/RECxxxx.TXT ----------------
+// 纯 UTF-8 文本，生成成功时由 cloudApplyJobs() 在主循环写卡；阅读/删除都走这里。
+static char *recMinutesPath(const char *wavPath, char *buf, size_t cap) {
+  if (!wavPath || !*wavPath) { buf[0] = 0; return buf; }
+  snprintf(buf, cap, "%s", wavPath);
+  size_t n = strlen(buf);
+  if (n >= 4 && strcasecmp(buf + n - 4, ".wav") == 0) n -= 4;
+  if (n + 5 > cap) { buf[0] = 0; return buf; }
+  strcpy(buf + n, ".TXT");
+  return buf;
+}
+
+static const char *recMinutesPathOf(int idx, char *buf, size_t cap) {
+  if (idx < 0 || idx >= gRecN) { buf[0] = 0; return buf; }
+  char wav[REC_PATH_SIZE];
+  recPathOf(idx, wav, sizeof(wav));
+  return recMinutesPath(wav, buf, cap);
+}
+
+static bool recMinutesSave(const char *wavPath, const String &result) {
+  char path[REC_PATH_SIZE];
+  recMinutesPath(wavPath, path, sizeof(path));
+  if (!path[0] || !result.length() || !tfEnsure()) return false;
+  File f = SD_MMC.open(path, FILE_WRITE);
+  if (!f) { Serial.printf("[REC] minutes write failed: %s\n", path); return false; }
+  size_t written = f.print(result);
+  f.close();
+  const char *slash = strrchr(wavPath, '/');
+  const char *base = slash ? slash + 1 : wavPath;
+  for (int i = 0; i < gRecN; i++)
+    if (!strcasecmp(gRec[i].name, base)) { gRec[i].minutes = true; break; }
+  Serial.printf("[REC] minutes saved %s (%u chars)\n", path, (unsigned)written);
+  return true;
+}
+
+static bool recMinutesLoad(int idx, String &out) {
+  char path[REC_PATH_SIZE];
+  recMinutesPathOf(idx, path, sizeof(path));
+  out = "";
+  if (!path[0] || !tfEnsure()) return false;
+  File f = SD_MMC.open(path);
+  if (!f || f.size() > 16384) { if (f) f.close(); return false; }
+  out = f.readString();
+  f.close();
+  return out.length() > 0;
+}
+
+static bool recMinutesRemove(int idx) {
+  char path[REC_PATH_SIZE];
+  recMinutesPathOf(idx, path, sizeof(path));
+  if (!path[0] || !SD_MMC.exists(path)) return false;
+  bool ok = SD_MMC.remove(path);
+  if (ok && idx >= 0 && idx < gRecN) gRec[idx].minutes = false;
+  return ok;
+}
+
+// 删录音同时删同名纪要；失败也重新扫一次，让 UI 与卡保持一致
+static bool recRemoveSel() {
+  char wav[REC_PATH_SIZE], txt[REC_PATH_SIZE];
+  recPathOf(gRecSel, wav, sizeof(wav));
+  recMinutesPath(wav, txt, sizeof(txt));
+  if (!wav[0]) return false;
+  bool ok = true;
+  if (SD_MMC.exists(wav)) ok = SD_MMC.remove(wav);
+  if (SD_MMC.exists(txt)) SD_MMC.remove(txt);
+  recScan();
+  return ok;
 }
 
 struct RecWriteJob {
@@ -181,6 +258,7 @@ static void recPollSave() {
     item.number = job.number;
     item.bytes = totalBytes;
     item.secs = secs;
+    item.minutes = false;            // 新录音尚无纪要
     gRecSel = 0;
     char message[24];
     snprintf(message, sizeof(message), "已存 %d 秒", secs);
@@ -315,8 +393,9 @@ static void recCmd(const String &cmd) {
     Serial.printf("[REC] %s, %d file(s):\n",
                   tfEnsure() ? "TF OK" : "NO TF", gRecN);
     for (int i = 0; i < gRecN; i++)
-      Serial.printf("  %d) %s  %u bytes  %u s%s\n", i + 1, gRec[i].name,
-                    (unsigned)gRec[i].bytes, (unsigned)gRec[i].secs, i == gRecSel ? "  *" : "");
+      Serial.printf("  %d) %s  %u bytes  %u s%s%s\n", i + 1, gRec[i].name,
+                    (unsigned)gRec[i].bytes, (unsigned)gRec[i].secs,
+                    gRec[i].minutes ? "  [M]" : "", i == gRecSel ? "  *" : "");
     return;
   }
   if (cmd.startsWith("RECREC")) {              // RECREC [秒]：无手指录一段并落盘
@@ -347,14 +426,45 @@ static void recCmd(const String &cmd) {
     recMakeMinutes();
     return;
   }
-  if (cmd.startsWith("RECDEL")) {              // RECDEL [序号]：删一段
+  if (cmd.startsWith("RECDEL")) {              // RECDEL [序号]：删一段（含同名纪要）
     recScan();
     int i = cmd.length() > 6 ? cmd.substring(6).toInt() - 1 : 0;
     if (i < 0 || i >= gRecN) { Serial.println("[REC] bad index"); return; }
     if (recIsPlaying() || gRecWrite || gAiState == AVS_PROCESSING) { Serial.println("[REC] busy"); return; }
-    char path[REC_PATH_SIZE]; recPathOf(i, path, sizeof(path));
-    Serial.printf("[REC] remove %s -> %d\n", path, (int)SD_MMC.remove(path));
+    gRecSel = i;
+    Serial.printf("[REC] remove #%d -> %d\n", i + 1, (int)recRemoveSel());
+    return;
+  }
+  if (cmd.startsWith("RECMREAD")) {            // RECMREAD [序号]：从 TF 卡读纪要并打开阅读页
     recScan();
+    int i = gRecSel;
+    if (cmd.length() > 8) { int v = cmd.substring(8).toInt(); if (v >= 1) i = v - 1; }
+    if (i < 0 || i >= gRecN) { Serial.println("[REC] bad index"); return; }
+    if (recMinutesLoad(i, gMinuteText)) {
+      gRecSel = i; gMinutePage = 0; gRecConfirmUntil = 0;
+      gMinuteOpen = true; gRecListOpen = false;
+      Serial.printf("[REC] minutes read %d chars\n", gMinuteText.length());
+    } else Serial.println("[REC] no minutes for this file");
+    return;
+  }
+  if (cmd.startsWith("RECMDEL")) {             // RECMDEL [序号]：只删纪要，保留录音
+    recScan();
+    int i = gRecSel;
+    if (cmd.length() > 7) { int v = cmd.substring(7).toInt(); if (v >= 1) i = v - 1; }
+    if (i < 0 || i >= gRecN) { Serial.println("[REC] bad index"); return; }
+    Serial.printf("[REC] remove minutes %d -> %d\n", i + 1, (int)recMinutesRemove(i));
+    return;
+  }
+  if (cmd == "RECMFAKE") {                     // 无网络时写入示例纪要，验收阅读/翻页/删除 UI
+    recScan();
+    if (!gRecN) { Serial.println("[REC] record first"); return; }
+    String demo;
+    for (int i = 1; i <= 4; i++) {
+      demo += "第" + String(i) + "段：本地验收示例，未调用云端。\n";
+      demo += "行动项：核对录音编号与时长，检查识别摘要，验证翻页与删除。\n";
+    }
+    char wav[REC_PATH_SIZE]; recPathOf(gRecSel, wav, sizeof(wav));
+    Serial.printf("[REC] fake minutes -> %d\n", (int)recMinutesSave(wav, demo));
     return;
   }
 }

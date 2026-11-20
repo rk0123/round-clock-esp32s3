@@ -290,7 +290,10 @@ static bool navigate(char dir) {
   }
   if (np == curPage) return false;
   // 离开页面的收尾（原来挂在返回键的点击里，键撤了就得搬到这儿）
-  if (curPage == P_RECORDER) recStopPlay();
+  if (curPage == P_RECORDER) {
+    recStopPlay(); gMinuteOpen = false; gRecListOpen = false;
+    gMinuteText = ""; gRecConfirmUntil = 0;
+  }
   if (curPage == P_MEMO) gMemoBackToTodo = false;
   if (curPage == P_TODO) { gMemoLastAdded = 0; gTodoNewFrom = -1; }   // 清掉"新"高亮
   curPage = np; detailIdx = -1;
@@ -2607,6 +2610,39 @@ static int drawWrapText(const char *s, int x, int y, int maxW, int lineH,
   return lines;
 }
 
+static String crTrimPunct(String s);   // 定义在后面；分页断行要剪掉行尾孤立标点
+
+// 分页版：与 drawWrapText 用同一套断行规则，只画第 page 页的 perPage 行，返回总页数。
+// 纪要可能上千字，不能一次全塞进屏幕；文本在 TF 卡上，读进来后按页翻。
+static int drawWrapTextPage(const char *s, int x, int y, int maxW, int lineH,
+                            int perPage, int page, uint16_t col, int font) {
+  int lines = 0;
+  const char *p = s ? s : "";
+  char buf[96];
+  while (*p) {
+    int n = 0; buf[0] = 0;
+    while (*p) {
+      unsigned char c = (unsigned char)*p;
+      int clen = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+      if (*(p + clen - 1) == 0) clen = strlen(p);
+      if (clen == 1 && *p == '\n') { p++; break; }
+      char tmp[8]; memcpy(tmp, p, clen); tmp[clen] = 0;
+      if (n > 0 && textWidth(buf, font, 1) + textWidth(tmp, font, 1) > maxW) break;
+      memcpy(buf + n, p, clen); n += clen; buf[n] = 0;
+      p += clen;
+    }
+    if (n == 0 && !*p) break;
+    if (col && lines >= page * perPage && lines < (page + 1) * perPage) {
+      String line = crTrimPunct(String(buf));   // 行尾孤立标点会独占一行，剪掉
+      if (line.length())
+        drawText(x, y + (lines - page * perPage) * lineH, line.c_str(), col, font, 1, 1);
+    }
+    lines++;
+  }
+  int pages = (lines + perPage - 1) / perPage;
+  return pages < 1 ? 1 : pages;
+}
+
 // ---------- 四个应用底部圆键统一规范 ----------
 // 小智 / 备忘 / 录音 / 待办全部用同一排、同一尺寸、同一套配色语义：
 //   y=285；三槽 x=108(左)/180(中)/252(右)；r=30；字号 16。
@@ -2821,13 +2857,9 @@ static void renderPet()   { petRender(); }
 // 所以停止录音不再自动跑 ASR，页面上三颗键：回放 / 录音 / 纪要。
 #define REC_ROWS 4
 static void renderRecList() {
-  clear(C_DARK2);
-  fillCircle(180, 180, 172, UI_PAGE_BG);
-  circle(180, 180, 168, COL(120, 96, 74), 2);
-  drawText(180, 34, "录音文件", C_CREAM, 16, 1, 1);
-  line(132, 60, 240, 60, UI_DIV);
+  uiPage("录音文件", COL(160, 110, 80));
   char cnt[12]; snprintf(cnt, sizeof(cnt), "%d", gRecN);   // 只画数字：FONT16 中英混排会撞
-  drawText(180, 66, cnt, C_GREY, 16, 1, 1);
+  drawText(180, 72, cnt, C_GREY, 16, 1, 1);
   int pages = (gRecN + REC_ROWS - 1) / REC_ROWS; if (pages < 1) pages = 1;
   if (gRecListPage >= pages) gRecListPage = pages - 1;
   if (gRecN == 0) {
@@ -2837,17 +2869,78 @@ static void renderRecList() {
   for (int r = 0; r < REC_ROWS; r++) {
     int idx = gRecListPage * REC_ROWS + r;
     if (idx >= gRecN) break;
-    int y = 90 + r * 38;
+    int y = 88 + r * 36;
     bool sel = (idx == gRecSel);
     fillRoundRect(66, y, 228, 32, 6, sel ? COL(70, 46, 34) : COL(28, 34, 42));
-    drawBtnText(78, y, 32, gRec[idx].name, sel ? C_YELLOW : C_WHITE, 16, 1, 0);
+    char nm[40];
+    fitText(nm, sizeof(nm), gRec[idx].name, 16, 148);
+    drawBtnText(78, y, 32, nm, sel ? C_YELLOW : C_WHITE, 16, 1, 0);
+    if (gRec[idx].minutes) fillCircle(232, y + 16, 3, C_GREEN);  // 绿点 = 已有纪要
     char s[12]; snprintf(s, sizeof(s), "%dS", (int)gRec[idx].secs);
     drawBtnText(278, y, 32, s, C_GREY, 16, 1, 2);
   }
   char pg[12]; snprintf(pg, sizeof(pg), "%d/%d", gRecListPage + 1, pages);
-  drawText(180, 248, pg, C_GREY, 16, 1, 1);
-  // v2.8：返回键撤掉（滑一下关浮层），只留翻页；只有一页时连这颗也不画
-  if (pages > 1) uiBtn(APP_BTN_C, APP_BTN_Y, APP_BTN_R, "翻页", UI_N);
+  drawText(180, 236, pg, C_GREY, 16, 1, 1);   // 上移：r30 底键顶端 y=255，原 250 会被压住
+  // v2.9：点条目只选中，三颗底键 = 播放 / 纪要(有则阅读) / 删除(二次确认)。
+  // 翻页走上下滑，左右滑仍按全局约定关列表，所以底排不再需要"翻页"键。
+  if (gRecN > 0) {
+    bool armed = millis() < gRecConfirmUntil;
+    uiBtn(APP_BTN_L, APP_BTN_Y, APP_BTN_R, "播放", UI_G);
+    uiBtn(APP_BTN_C, APP_BTN_Y, APP_BTN_R,
+          gRec[gRecSel].minutes ? "阅读" : "纪要", UI_N);
+    uiBtn(APP_BTN_RR, APP_BTN_Y, APP_BTN_R, armed ? "确认" : "删除", UI_D);
+  }
+}
+
+// 纪要阅读页：全文在 TF 卡，读进 gMinuteText 后按页显示；上下滑翻页、左右滑关闭。
+static void renderMinutes() {
+  uiPage("纪要", COL(120, 150, 100));
+  if (gRecSel < 0 || gRecSel >= gRecN) { gMinuteOpen = false; return; }
+  char nm[40];
+  fitText(nm, sizeof(nm), gRec[gRecSel].name, 16, 258);
+  drawText(180, 74, nm, C_CREAM, 16, 1, 1);
+  char pg[16];
+  int total = drawWrapTextPage(gMinuteText.c_str(), 180, 100, 264, 18, 7,
+                               gMinutePage, C_WHITE, 16);
+  if (gMinutePage >= total) gMinutePage = total - 1;
+  snprintf(pg, sizeof(pg), "%d/%d", gMinutePage + 1, total);
+  drawText(180, 236, pg, C_GREY, 16, 1, 1);
+  // 左=上一页 / 中=下一页 / 右=删除纪要；只有一页时删纪要键居中，免得视觉偏右
+  if (total > 1) {
+    uiBtn(APP_BTN_L, APP_BTN_Y, APP_BTN_R, "上一页", UI_N);
+    uiBtn(APP_BTN_C, APP_BTN_Y, APP_BTN_R, "下一页", UI_N);
+  }
+  bool armed = millis() < gRecConfirmUntil;
+  uiBtn(total > 1 ? APP_BTN_RR : APP_BTN_C, APP_BTN_Y, APP_BTN_R,
+        armed ? "确认" : "删纪要", UI_D);
+}
+
+static bool minuteTap(int x, int y) {
+  int total = drawWrapTextPage(gMinuteText.c_str(), 180, 100, 264, 18, 7,
+                               gMinutePage, 0, 16);  // 用透明色只数页数（col=0 不画）
+  if (total < 1) total = 1;
+  int delX = total > 1 ? APP_BTN_RR : APP_BTN_C;
+  if (hit(x, y, delX, APP_BTN_Y, APP_BTN_HIT)) {
+    if (millis() < gRecConfirmUntil) {
+      if (recMinutesRemove(gRecSel)) {
+        recSetMsg("纪要已删"); gMinuteOpen = false; gMinuteText = "";
+        Serial.println("[REC] minutes removed");
+      } else { showToast("删除失败"); Serial.println("[REC] minutes remove failed"); }
+    } else {
+      gRecConfirmUntil = millis() + 2500;
+      showToast("再点一次确认");
+    }
+    render(); return true;
+  }
+  if (total > 1) {
+    if (hit(x, y, APP_BTN_L, APP_BTN_Y, APP_BTN_HIT)) {
+      gMinutePage = (gMinutePage + total - 1) % total; render(); return true;
+    }
+    if (hit(x, y, APP_BTN_C, APP_BTN_Y, APP_BTN_HIT)) {
+      gMinutePage = (gMinutePage + 1) % total; render(); return true;
+    }
+  }
+  return true;
 }
 
 static bool recListTap(int x, int y);
@@ -2855,6 +2948,7 @@ static bool recListTap(int x, int y);
 static void renderRecorder() {
   // 第一次进这个页面先把卡里的录音列出来（进页面就走，不在 250ms 渲染里反复扫卡）
   if (!gRecScanned) { recScan(); gRecScanned = (gRecN > 0) || tfEnsure(); }
+  if (gMinuteOpen) { renderMinutes(); return; }
   if (gRecListOpen) { renderRecList(); return; }
   uiPage("录音机", COL(160, 110, 80));
   bool rec = gAiState == AVS_RECORDING && gAiRecToFile;
@@ -2917,31 +3011,66 @@ static void renderRecorder() {
   }
 
   // ---- 纪要（可选，点"纪要"键才生成） ----
+  // 正文已落盘 /REC/RECxxxx.TXT 并有专门阅读页，主页只给短提示：
+  // 原来把整段纪要铺在 y=222..256，会压到 y=255 起的底键。
   if (gAiResult.length() && gAiResultOwner == AVM_MEETING) {
-    drawText(180, 204, gAiState == AVS_ERROR ? "识别状态" : "纪要", COL(230, 170, 120), 16, 1, 1);
-    drawWrapText(gAiResult.c_str(), 180, 222, 264, 18, 2, C_WHITE, 16);
+    if (gAiState == AVS_ERROR) {
+      char e[36]; fitText(e, sizeof(e), gAiResult.c_str(), 16, 250);
+      drawText(180, 204, "识别状态", COL(240, 150, 140), 16, 1, 1);
+      drawText(180, 228, e, C_WHITE, 16, 1, 1);
+    } else {
+      drawText(180, 204, "纪要已存卡", COL(230, 170, 120), 16, 1, 1);
+      drawText(180, 228, "点阅读查看", C_WHITE, 16, 1, 1);
+    }
   }
 
   // ---- 三颗键：回放 / 录音 / 纪要（统一网格 + 语义配色）----
   uiBtn(APP_BTN_L, APP_BTN_Y, APP_BTN_R, play ? "停止" : "回放", play ? UI_D : UI_G);
   if (rec) uiBtn(APP_BTN_C, APP_BTN_Y, APP_BTN_R, "停止", UI_D);
   else uiBtn(APP_BTN_C, APP_BTN_Y, APP_BTN_R, "录音", busy ? UI_N : UI_A);
-  uiBtn(APP_BTN_RR, APP_BTN_Y, APP_BTN_R, busy ? "取消" : "纪要", UI_N);
+  // 选中段已有纪要点"阅读"直接进阅读页，否则才跑生成（生成也落盘到 TF 卡）
+  uiBtn(APP_BTN_RR, APP_BTN_Y, APP_BTN_R,
+        busy ? "取消" : (gRecN > 0 && gRec[gRecSel].minutes ? "阅读" : "纪要"), UI_N);
   if (rec || busy) drawWaitRing(APP_BTN_C, APP_BTN_Y, APP_BTN_R);
 }
 
 static bool recListTap(int x, int y) {
-  int pages = (gRecN + REC_ROWS - 1) / REC_ROWS; if (pages < 1) pages = 1;
-  if (pages > 1 && hit(x, y, APP_BTN_C, APP_BTN_Y, APP_BTN_HIT)) { gRecListPage = (gRecListPage + 1) % pages; render(); return true; }
+  if (gRecN > 0) {
+    // 底键三颗：播放 / 纪要(有则阅读) / 删除。删除必须点两次，防误触。
+    if (hit(x, y, APP_BTN_L, APP_BTN_Y, APP_BTN_HIT)) {
+      recTogglePlay(); render(); return true;
+    }
+    if (hit(x, y, APP_BTN_C, APP_BTN_Y, APP_BTN_HIT)) {
+      if (gRec[gRecSel].minutes) {
+        if (recMinutesLoad(gRecSel, gMinuteText)) {
+          gMinutePage = 0; gRecConfirmUntil = 0;
+          gRecListOpen = false; gMinuteOpen = true;
+        } else showToast("纪要读取失败");
+      } else recMakeMinutes();
+      render(); return true;
+    }
+    if (hit(x, y, APP_BTN_RR, APP_BTN_Y, APP_BTN_HIT)) {
+      if (millis() < gRecConfirmUntil) {
+        recStopPlay();
+        bool ok = recRemoveSel();
+        gRecConfirmUntil = 0;
+        showToast(ok ? "已删除" : "删除失败");
+        Serial.printf("[REC] file removed -> %d left\n", gRecN);
+      } else {
+        gRecConfirmUntil = millis() + 2500;
+        showToast("再点一次确认");
+      }
+      render(); return true;
+    }
+  }
   for (int r = 0; r < REC_ROWS; r++) {
-    int ry = 90 + r * 38;
+    int ry = 88 + r * 36;
     if (x >= 66 && x <= 294 && y >= ry && y <= ry + 32) {
       int idx = gRecListPage * REC_ROWS + r;
       if (idx < gRecN) {
         gRecSel = idx;
-        gAiTranscript = ""; gAiResult = "";     // 换了一段，旧纪要作废
-        gRecListOpen = false;
-        recPlaySel();
+        gAiTranscript = ""; gAiResult = "";     // 换了一段，旧纪要显示作废（文件仍在卡上）
+        gRecConfirmUntil = 0;
         render();
       }
       return true;
@@ -3304,8 +3433,10 @@ bool cfgExtra(const String &raw) {
       up == "PRON" || up.startsWith("PRON ")) { wordCmd(raw); return true; }
   if (up == "MIC" || up == "MICPIN" || up.startsWith("MICTEST")) { micCmd(raw); return true; }
   // 录音机验收：REC / RECLIST / RECREC [秒] / RECPLAY [n] / RECSTOP / RECMIN [n] / RECDEL [n]
+  // v2.9 纪要：RECMREAD [n] / RECMDEL [n] / RECMFAKE（无网络时写示例，验阅读与删除）
   if (up == "REC" || up == "RECLIST" || up.startsWith("RECREC") || up.startsWith("RECPLAY")
-      || up == "RECSTOP" || up.startsWith("RECMIN") || up.startsWith("RECDEL")) {
+      || up == "RECSTOP" || up.startsWith("RECMIN") || up.startsWith("RECDEL")
+      || up.startsWith("RECMREAD") || up.startsWith("RECMDEL") || up == "RECMFAKE") {
     recCmd(raw); return true;
   }
   if (up == "XZCHAT" || up == "XZCLOSE" || up == "XZINFO" || up == "XZTEST" ||
@@ -3747,6 +3878,7 @@ static void handleTap(int x, int y) {
       }
       break;
     case P_RECORDER:
+      if (gMinuteOpen) { minuteTap(x, y); return; }
       if (gRecListOpen) { recListTap(x, y); return; }
       if (gAiState == AVS_PROCESSING) {
         if (gAiMode == AVM_MEETING && hit(x, y, APP_BTN_RR, APP_BTN_Y, APP_BTN_HIT))
@@ -3756,7 +3888,14 @@ static void handleTap(int x, int y) {
       }
       if (hit(x, y, APP_BTN_C, APP_BTN_Y, APP_BTN_HIT)) { recToggleRecord(); return; }
       if (hit(x, y, APP_BTN_L, APP_BTN_Y, APP_BTN_HIT)) { recTogglePlay(); render(); return; }
-      if (hit(x, y, APP_BTN_RR, APP_BTN_Y, APP_BTN_HIT)) { recMakeMinutes(); render(); return; }
+      if (hit(x, y, APP_BTN_RR, APP_BTN_Y, APP_BTN_HIT)) {
+        if (gRecN > 0 && gRec[gRecSel].minutes) {
+          if (recMinutesLoad(gRecSel, gMinuteText)) {
+            gMinutePage = 0; gRecConfirmUntil = 0; gMinuteOpen = true;
+          } else showToast("纪要读取失败");
+        } else recMakeMinutes();
+        render(); return;
+      }
       // 点文件名那一行 = 打开录音列表（挑别的段来回放）
       if (y >= 126 && y <= 176) { gRecListPage = gRecSel / REC_ROWS; gRecListOpen = true; render(); return; }
       break;
@@ -3962,8 +4101,30 @@ static void pollTouch() {
       if (curPage == P_SETTINGS && gCityList) {
         gCityList = false; Serial.println("[UI] subpage close -> settings"); render(); continue;
       }
+      // 录音列表 / 纪要阅读：上下滑翻页（同 Wi-Fi 列表约定，上滑看下一页），
+      // 左右滑才走下面的全局"关子页"，这样既能浏览又不破坏手势返回。
+      if (curPage == P_RECORDER && (gRecListOpen || gMinuteOpen) &&
+          (ev.type == TE_UP || ev.type == TE_DOWN)) {
+        bool fwd = (ev.type == TE_UP);
+        if (gMinuteOpen) {
+          int total = drawWrapTextPage(gMinuteText.c_str(), 180, 100, 264, 18, 7, 0, 0, 16);
+          if (total < 1) total = 1;
+          gMinutePage = (gMinutePage + (fwd ? 1 : total - 1)) % total;
+          Serial.printf("[REC] minutes page %d/%d\n", gMinutePage + 1, total);
+        } else {
+          int pages = (gRecN + REC_ROWS - 1) / REC_ROWS; if (pages < 1) pages = 1;
+          gRecListPage = (gRecListPage + (fwd ? 1 : pages - 1)) % pages;
+          Serial.printf("[REC] list page %d/%d\n", gRecListPage + 1, pages);
+        }
+        render(); continue;
+      }
+      if (curPage == P_RECORDER && gMinuteOpen) {
+        gMinuteOpen = false; gMinuteText = ""; gRecConfirmUntil = 0;
+        Serial.println("[UI] subpage close -> recorder"); render(); continue;
+      }
       if (curPage == P_RECORDER && gRecListOpen) {
-        gRecListOpen = false; Serial.println("[UI] subpage close -> recorder"); render(); continue;
+        gRecListOpen = false; gRecConfirmUntil = 0;
+        Serial.println("[UI] subpage close -> recorder"); render(); continue;
       }
       if (curPage == P_WORDS && wordPicking) {
         wordPicking = false; Serial.println("[UI] subpage close -> words"); render(); continue;

@@ -744,6 +744,7 @@ static bool     gAiRecToFile  = false;       // 本段是"录音机"（停=存�
 static void recToggleRecord(uint32_t limitMs = MIC_MAX_SAMPLES / 16);               // recorder.h 里的录音机按键（时长到顶时用它收尾）
 static bool recOpenPcm(const char *path, File &wav, int &frames);
 static void recStopPlay();                   // 录音前先停回放（同一组 I2S0，边放边录就是啸叫）
+static bool recMinutesSave(const char *wavPath, const String &result);  // v2.9：纪要落 TF 卡
 static int gAiPeak = 0, gAiRms = 0;          // 录音电平（主循环刷新，UI 画条）
 // 结果归属：问答 / 备忘 / 会议各看各的，切页不串台
 static AiVoiceMode gAiResultOwner = AVM_CHAT;
@@ -872,6 +873,10 @@ static void cloudApplyJobs() {
       if (!job->frames) Serial.printf("[AI] ASRTODO added %d todos (total %d)\n", gMemoLastAdded, gTodoN);
     }
     gAiResult = job->error.length() ? job->error : job->result;
+    // 会议纪要成功后立刻落盘：与录音同编号的 /REC/RECxxxx.TXT，掉电可再读再管。
+    // 这里在主循环执行（cloudApplyJobs），写卡安全；失败只影响纪要文件，不影响 UI 显示。
+    if (job->mode == AVM_MEETING && !job->error.length() && job->recording.length())
+      recMinutesSave(job->recording.c_str(), gAiResult);
   }
   gAiState = job->error.length() ? AVS_ERROR : AVS_DONE;
   delete job;

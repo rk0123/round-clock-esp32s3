@@ -291,7 +291,9 @@ static void wordRender() {
     }
     uiPill(OX[i] - 67, OY[i] - 21, 135, 42, tab[wordOpts[i]].cn, st);
   }
-  uiBtn(180, 310, 22, wordPicked ? "下一题" : "跳过", wordPicked ? UI_A : UI_N);
+  // 三字中文 48px 宽：r22 时在字形上下缘圆内只剩 41px，会被圆边切掉。
+  // 两态统一 r27（底部 310+27 距圆心 157 < 158 安全线），切换时按钮也不跳动。
+  uiBtn(180, 310, 27, wordPicked ? "下一题" : "跳过", wordPicked ? UI_A : UI_N);
 }
 
 // 8 宫格选词书：4 列 × 2 行，圆键 r28，圆心距 57 不重叠

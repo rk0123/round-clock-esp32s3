@@ -5,7 +5,7 @@
 //    · 页面底：clear(C_DARK) + fillCircle(180,180,172,COL(18,24,32))
 //              + circle(180,180,168,ring,2)
 //    · 标题  ：y=36 / FONT16 / 居中；分隔线 y=64, x=132..240
-//    · 返回键：drawFeatureBack() @ (106,62) r16（main.cpp 定义）
+//    · 返回  ：v2.8 起页面一律不画返回键 —— 左右滑（或下滑）回上一层，上滑回表盘
 //    · 圆键  ：一律 uiBtn()，半径 24（动作）/ 28（选项）/ 44（语音）
 //              文字一律 FONT16（语音主键 24），避免 FONT12 中文空白
 //    · 配色  ：UI_N 普通 / UI_A 强调橙 / UI_G 绿 / UI_D 危险红 / UI_S 选中
@@ -13,7 +13,6 @@
 // ============================================================
 static void drawBtnText(int x, int boxY, int boxH, const char *s, uint16_t col,
                         int font, int scale, int align);
-static void drawFeatureBack();   // main.cpp 定义于后文；此处仅前向声明供 uiPage 调用
 
 #define UI_N  0    // 普通：深蓝灰
 #define UI_A  1    // 强调：橙
@@ -25,19 +24,12 @@ static void drawFeatureBack();   // main.cpp 定义于后文；此处仅前向�
 #define UI_DIV      COL(60, 72, 86)
 #define UI_PAGE_BG  COL(18, 24, 32)
 
-// 公共返回键坐标：必须早于 words.h / pet.h 定义（原来放 main.cpp 后文，头文件用到会编译失败）
-#define FB_BACK_CX   106
-#define FB_BACK_CY   62
-#define FB_BACK_R    16
-#define FB_BACK_HIT  22
-
-// 统一页面底 + 标题 + 分隔线 + 返回键。ring 传 0 用默认冷灰。
+// 统一页面底 + 标题 + 分隔线。ring 传 0 用默认冷灰。
 // divider=false 用于标题下方要放整条胶囊/长控件的页面（分隔线会压在控件上）。
 static void uiPage(const char *title, uint16_t ring = 0, bool divider = true) {
   clear(C_DARK);
   fillCircle(180, 180, 172, UI_PAGE_BG);
   circle(180, 180, 168, ring ? ring : UI_RING, 2);
-  drawFeatureBack();
   drawText(180, 36, title, C_CREAM, 16, 1, 1);
   if (divider) line(132, 64, 240, 64, UI_DIV);
 }

@@ -174,7 +174,8 @@ static std::atomic<bool> gExtPcmOn{false};
 enum : uint8_t {
   AQ_NONE = 0, AQ_PLAY, AQ_TOGGLE, AQ_NEXT, AQ_STOP, AQ_TONE, AQ_VOL,
   AQ_SOURCE, AQ_SELECT, AQ_RESCAN_TF, AQ_PODFEED, AQ_PODADD, AQ_PODCLEAR, AQ_TFTEST,
-  AQ_PLAYFILE            // 播一条指定路径的本地音频（录音回放用，text = 完整路径）
+  AQ_PLAYFILE,           // 播一条指定路径的本地音频（录音回放用，text = 完整路径）
+  AQ_PLAYURL             // 播一条网络音频（背单词发音：有道 dictvoice，text = 完整 URL）
 };
 struct AudCmd {
   uint8_t cmd; int arg; int arg2;
@@ -887,6 +888,23 @@ static void audExec(const AudCmd &c) {
       Serial.printf("[REC] playfile '%s' -> %s\n", c.text, ok ? "OK" : "FAILED");
       break;
     }
+    // ---- 背单词发音（v2.8）：网络 MP3，播完即停，不进曲库不续播 ----
+    case AQ_PLAYURL: {
+      if (!c.text[0]) break;
+      if (!wifiOK) { Serial.println("[PRON] no WiFi, skip"); break; }
+      gAudio->stopSong();
+      vTaskDelay(pdMS_TO_TICKS(60));      // socket 释放竞态，和切台同一套规避
+      bool ok = gAudio->connecttohost(c.text);
+      if (!ok) { vTaskDelay(pdMS_TO_TICKS(180)); ok = gAudio->connecttohost(c.text); }
+      gAudioState = ok ? A_CONNECTING : A_ERROR;
+      gToneMode = true;                   // 本地提示音同款：播完就停
+      gAudStartMs = millis(); gAudLastData = millis();
+      gAudLastBuf = 0xFFFFFFFF;
+      gAudLastI2s = gI2sDiag[3]; gAudStartI2s = gI2sDiag[3];
+      gAudRetryAt = 0; gAudRetry = 0;
+      Serial.printf("[PRON] %s -> %s\n", c.text, ok ? "OK" : "FAILED");
+      break;
+    }
     case AQ_TFTEST:
       if (gAudioReady) { gAudio->stopSong(); gAudioState = A_IDLE; }
       // arg=1 写一个中文文件名，用来端到端验收「TF 卡中文歌名」链路
@@ -971,6 +989,8 @@ static int  audioPodFeedIndex()           { return gPodFeedIdx; }
 static const char *audioPodFeedName()     { return POD_FEEDS[gPodFeedIdx].name; }
 static void audioPodAdd(const char *name, const char *url) { audSend(AQ_PODADD, 0, 0, url, name); }
 static void audioPodClear()               { audSend(AQ_PODCLEAR); }
+// v2.8：背单词发音。播完即停（gToneMode），不进曲库、不自动续播下一条。
+static void audioPlayUrl(const char *url) { if (url && *url) audSend(AQ_PLAYURL, 0, 0, url); }
 
 // ------------------------------------------------------------------ 小智 PCM 输出（v2.7）
 // 走库已经建好的 I2S0 TX 句柄：播放器必须先停（同一组 DMA 描述符），

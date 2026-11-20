@@ -14,8 +14,8 @@ static void drawBtnText(int x, int boxY, int boxH, const char *s, uint16_t col,
 static bool hit(int x, int y, int cx, int cy, int r);
 static void showToast(const char *s);
 static void render();
-static void drawFeatureBack();   // main.cpp 功能页公共返回键
 #include "ui_kit.h"              // 二期统一 UI：uiPage / uiBtn / uiPill
+#include "font_serif.h"          // v2.8：Georgia 30px 衬线英文（背单词题干用，4-bit AA）
 
 // ---------------- 8 档词库 ----------------
 #define WORD_BOOK_N 8
@@ -168,6 +168,52 @@ static void wordNextQuestion() {
   wordWasRight = false;
 }
 
+// ---------------- 发音（v2.8）----------------
+// 用有道词典的免密钥 dictvoice 接口（英音 type=1 / 美音 type=2，实测返回 audio/mpeg）。
+// 必须走网络，没连 Wi-Fi 时静默跳过；开关写 NVS "wd.pron"，掉电保留。
+static bool gWordPronOn = true;
+static bool gWordPronLoaded = false;
+static void wordPronLoad() {
+  if (gWordPronLoaded) return;         // NVS 要等 setup 里 cfgLoad() 之后才读得到
+  gWordPronLoaded = true;
+  gWordPronOn = cfgGetInt("wd.pron", 1) != 0;
+}
+static void wordPronounce(bool force = false) {
+  wordPronLoad();
+  if ((!gWordPronOn && !force) || !gAudQ || wordPos >= wordQueueN) return;
+  const WordEntry *tab = wordTable();
+  const char *w = tab[wordOpts[wordAnsSlot]].en;
+  char url[220];
+  int k = snprintf(url, sizeof(url), "https://dict.youdao.com/dictvoice?audio=");
+  for (const char *p = w; *p && k < (int)sizeof(url) - 16; ++p) {
+    unsigned char ch = (unsigned char)*p;
+    bool plain = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                 (ch >= '0' && ch <= '9') || ch == '-' || ch == '_';
+    if (plain) url[k++] = (char)ch;
+    else       k += snprintf(url + k, sizeof(url) - k, "%%%02X", ch);
+  }
+  snprintf(url + k, sizeof(url) - k, "&type=2");
+  Serial.printf("[PRON] %s\n", url);
+  audioPlayUrl(url);
+}
+
+// 右上角小喇叭：开=黄绿声波，关=灰色加一道斜杠
+static void drawPronIcon(int cx, int cy) {
+  wordPronLoad();
+  uint16_t c = gWordPronOn ? C_YELLOW : C_GREY;
+  fillCircle(cx, cy + 1, 16, mix(COL(20, 26, 34), C_DARK, 90));
+  fillCircle(cx, cy, 16, gWordPronOn ? COL(34, 62, 50) : COL(38, 46, 58));
+  circle(cx, cy, 16, gWordPronOn ? C_GREEN : COL(78, 90, 110), 2);
+  fillRect(cx - 8, cy - 3, 4, 6, c);
+  fillTri(cx - 4, cy - 3, cx + 2, cy - 8, cx + 2, cy + 8, c);
+  if (gWordPronOn) {
+    arcRing(cx + 3, cy, 8, 50, 130, 2, c);
+    arcRing(cx + 3, cy, 12, 50, 130, 2, c);
+  } else {
+    line(cx + 3, cy - 6, cx + 10, cy + 6, COL(220, 110, 110), 2);
+  }
+}
+
 // 作答后更新这个词的艾宾浩斯阶段：对→下一间隔，错→回到第一阶段（5 分钟后）
 static void wordGrade(bool right) {
   int gi = wordGlobalIndex(wordBook, wordOpts[wordAnsSlot]);
@@ -233,7 +279,10 @@ static void wordRender() {
 
   const WordEntry *tab = wordTable();
   int ans = wordOpts[wordAnsSlot];
-  drawText(180, 132, tab[ans].en, C_WHITE, 24, 1, 1);
+  // v2.8：衬线英文（Georgia 30px，4-bit AA）。baselineY=154，降部落到 159，
+  // 下一行释义在 166，正好留 7px 空隙；点这行文字可手动重播发音。
+  drawSerifText(180, 154, tab[ans].en, C_WHITE);
+  drawPronIcon(254, 62);
   drawText(180, 166, tab[ans].ex, COL(150, 166, 188), 12, 1, 1);
 
   // 四个选项：2×2
@@ -268,11 +317,8 @@ static void renderWordPicker() {
 }
 
 static void wordTap(int x, int y) {
-  // 选词书子页：返回键回做题页；点圆键切书并重置进度
+  // 选词书子页：点圆键切书并重置进度（退出子页靠滑动，main.cpp pollTouch 统一处理）
   if (wordPicking) {
-    if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
-      wordPicking = false; render(); return;
-    }
     static const int PX[4] = {103, 160, 217, 274};
     static const int PY[2] = {150, 230};
     for (int b = 0; b < WORD_BOOK_N; b++) {
@@ -280,11 +326,21 @@ static void wordTap(int x, int y) {
         if (b != wordBook) {
           wordBook = b; wordBookPage = b / 4;
           wordReset(false); wordSave(); showToast(WORD_BOOK_NAMES[b]);
+          wordPronounce();                       // 换书后自动读一遍新词
         }
         wordPicking = false; render(); return;
       }
     }
     return;
+  }
+  // v2.8：右上角小喇叭 = 发音开关；开的时候顺手读一遍当前词
+  if (hit(x, y, 254, 62, 18)) {
+    wordPronLoad();
+    gWordPronOn = !gWordPronOn;
+    cfgSetInt("wd.pron", gWordPronOn ? 1 : 0);
+    showToast(gWordPronOn ? "PRON ON" : "PRON OFF");
+    if (gWordPronOn) wordPronounce(true);
+    render(); return;
   }
   // 主页面：顶部「当前 xx」胶囊（(128,66) 104x30，热区外扩 6px，手指好按）
   if (x >= 122 && x <= 238 && y >= 60 && y <= 102) { wordPicking = true; render(); return; }
@@ -292,6 +348,8 @@ static void wordTap(int x, int y) {
     if (hit(x, y, 180, 284, 34)) { wordReset(false); render(); }
     return;
   }
+  // 点英文单词本身 = 重播（手动点不受开关限制）
+  if (y >= 128 && y <= 162 && x >= 40 && x <= 320) { wordPronounce(true); return; }
   if (!wordPicked) {
     static const int OX[4] = {107, 253, 107, 253};
     static const int OY[4] = {204, 204, 258, 258};
@@ -312,7 +370,8 @@ static void wordTap(int x, int y) {
     if (!wordPicked) { wordWrong++; wordGrade(false); }
     wordPos++;
     wordSave();
-    if (wordPos < wordQueueN) wordNextQuestion(); else { wordQueueN = wordPos; }
+    if (wordPos < wordQueueN) { wordNextQuestion(); wordPronounce(); }
+    else { wordQueueN = wordPos; }
     render();
   }
 }
@@ -347,5 +406,15 @@ static void wordCmd(const String &cmd) {
       wordBook = b; wordBookPage = b / 4; wordReset(false); render();
       Serial.printf("[WORD] book=%s\n", WORD_BOOK_NAMES[b]);
     }
+  } else if (cmd == "PRON") {
+    wordPronLoad();
+    Serial.printf("[PRON] switch=%d\n", (int)gWordPronOn);
+    wordPronounce(true);                 // 强制读一遍，方便无手指验收
+  } else if (cmd.startsWith("PRON ")) {
+    int v = cmd.substring(5).toInt();
+    wordPronLoad(); gWordPronOn = v ? true : false;
+    cfgSetInt("wd.pron", gWordPronOn ? 1 : 0);
+    Serial.printf("[PRON] switch -> %d\n", (int)gWordPronOn);
+    render();
   }
 }

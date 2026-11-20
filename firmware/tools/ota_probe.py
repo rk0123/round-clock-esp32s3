@@ -1,12 +1,9 @@
 """PC 侧探针：用设备的 Device-Id / Client-Id 查 OTA，拿 websocket 配置，再试握手。
 
 用法：
-  python ota_probe.py ota <mac>                     # 只查配置
-  python ota_probe.py ws opus <url> <token> <mac>   # 用 opus 握手
-  python ota_probe.py ws pcm  <url> <token> <mac>
-
-mac 传设备自己的地址（串口 STATUS 或 esptool read_mac 能看到），不要写死在文件里：
-它是 xiaozhi 的设备身份，公开出去等于把别人设备的身份牌贴到网上。
+  python ota_probe.py ota                 # 只查配置
+  python ota_probe.py ws <url> <token>    # 用 opus 握手
+  python ota_probe.py ws pcm <url> <token>
 """
 import json
 import sys
@@ -15,7 +12,7 @@ import uuid as uuidlib
 
 import requests
 
-MAC = ""          # 运行时由命令行传入
+MAC = "84:c7:bb:77:a9:74"
 OTA = "https://api.tenclass.net/xiaozhi/ota/"
 
 
@@ -31,7 +28,7 @@ def device_body(client_id: str) -> dict:
         "chip_info": {"model": 9, "cores": 2, "revision": 2, "features": 18},
         "application": {
             "name": "roundclock",
-            "version": "2.7",
+            "version": "2.6.2",
             "compile_time": "Nov 18 2026T15:53:00Z",
             "idf_version": "v5.1.4",
             "elf_sha256": "0" * 64,
@@ -53,7 +50,7 @@ def query_ota(client_id: str):
         "Client-Id": client_id,
         "Accept-Language": "zh-CN",
         "Activation-Version": "1",
-        "User-Agent": "esp32-s3-touch-lcd-1.85b/2.7",
+        "User-Agent": "esp32-s3-touch-lcd-1.85b/2.6.2",
     }
     r = requests.post(OTA, headers=headers, data=json.dumps(device_body(client_id)), timeout=15)
     print("HTTP", r.status_code)
@@ -101,25 +98,10 @@ def ws_hello(url: str, token: str, fmt: str, client_id: str):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(__doc__)
-        raise SystemExit(1)
     if sys.argv[1] == "ota":
-        if len(sys.argv) < 3:
-            print("用法: python ota_probe.py ota <mac>")
-            raise SystemExit(1)
-        MAC = sys.argv[2]
-        cid = sys.argv[3] if len(sys.argv) > 3 else str(uuidlib.uuid4())
+        cid = sys.argv[2] if len(sys.argv) > 2 else str(uuidlib.uuid4())
         print("client_id =", cid)
         query_ota(cid)
-    elif sys.argv[1] == "ws":
-        if len(sys.argv) < 6:
-            print("用法: python ota_probe.py ws <opus|pcm> <url> <token> <mac>")
-            raise SystemExit(1)
-        fmt = sys.argv[2]
-        MAC = sys.argv[5]
-        ws_hello(sys.argv[3], sys.argv[4], fmt,
-                 sys.argv[6] if len(sys.argv) > 6 else str(uuidlib.uuid4()))
     else:
-        print(__doc__)
-        raise SystemExit(1)
+        fmt = sys.argv[2]
+        ws_hello(sys.argv[3], sys.argv[4], fmt, sys.argv[5] if len(sys.argv) > 5 else str(uuidlib.uuid4()))

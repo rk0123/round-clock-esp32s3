@@ -249,9 +249,6 @@ static int  gNetEnc[16];
 // 第 5 行城市卡：y=282 时圆内可用 x 只有 62..298，所以只做 236 宽
 #define ST_CITY_X  62
 #define ST_CITY_W  236
-#define ST_BACK_CX 92
-#define ST_BACK_CY 76
-#define ST_BACK_R  15
 #define ST_BTN_MINUS_CX 238
 #define ST_BTN_PLUS_CX  290
 #define ST_BTN_R   15
@@ -266,6 +263,9 @@ static int  gNetEnc[16];
 //   · 任意应用 ：上滑 -> 回表盘（home 手势）；其余方向 -> 回应用中心（上一层）
 // 于是只有三层：表盘 <-> 应用中心 <-> 某个应用；上滑永远是"回桌面"。
 // 表盘上唯一被特殊处理的是上滑 —— 这一层没有 home 可回，正好用来换表盘。
+// 设置页是从哪一页下拉进来的 —— 退出设置要回原页（v2.8 起返回全靠手势，所以要提前声明）
+static Page gSettingsFrom = P_ANALOG;
+
 static bool navigate(char dir) {
   Page np = curPage;
   if (curPage == P_ANALOG) {
@@ -275,9 +275,18 @@ static bool navigate(char dir) {
   } else if (dir == 'U') {
     np = P_ANALOG;                 // home：任意应用上滑回表盘
   } else {
-    np = P_APPS;                   // 其余方向 = 返回上一层（应用中心）
+    // v2.8：页面上的返回键全部撤掉，左右/下滑 = 返回上一层。
+    // 上一层不一定是应用中心：设置来自表盘、配网来自设置、备忘可能来自待办。
+    if      (curPage == P_SETTINGS)                    np = gSettingsFrom;
+    else if (curPage == P_WIFI)                        np = P_SETTINGS;
+    else if (curPage == P_MEMO && gMemoBackToTodo)     np = P_TODO;
+    else                                               np = P_APPS;
   }
   if (np == curPage) return false;
+  // 离开页面的收尾（原来挂在返回键的点击里，键撤了就得搬到这儿）
+  if (curPage == P_RECORDER) recStopPlay();
+  if (curPage == P_MEMO) gMemoBackToTodo = false;
+  if (curPage == P_TODO) { gMemoLastAdded = 0; gTodoNewFrom = -1; }   // 清掉"新"高亮
   curPage = np; detailIdx = -1;
   Serial.printf("[UI] nav %c -> page %d\n", dir, (int)curPage);
   return true;
@@ -1535,10 +1544,9 @@ static void renderMusicList() {
   }
   char pg[16]; snprintf(pg, sizeof(pg), "%d/%d", gMusicPage + 1, pages);
   drawText(180, 274, pg, C_GREY, 12, 1, 1);
-  fillRoundRect(96, 288, 78, 22, 8, C_SLATE);
-  drawBtnText(135, 288, 22, "返回", C_WHITE, 16);
-  fillRoundRect(186, 288, 78, 22, 8, C_ORANGE_D);
-  drawBtnText(225, 288, 22, "更多", C_WHITE, 16);
+  // v2.8：曲库浮层不再有"返回"键 —— 左右滑退出、上下滑翻页（见 pollTouch）
+  fillRoundRect(141, 288, 78, 22, 8, C_ORANGE_D);
+  drawBtnText(180, 288, 22, "更多", C_WHITE, 16);
 }
 
 static void renderMusic() {
@@ -2145,13 +2153,9 @@ static void renderWifi() {
       if (maxScroll > 0)
         drawText(180, 276, gWifiScroll > 0 ? "swipe / more ^v" : "more networks v", C_GREY, 12, 1, 1);
     }
-    // 底部两个按钮：BACK（回设置页）/ RESCAN
-    // 原来把返回键画在左上角 (45,39) —— 那里已出圆屏安全区（r≈195），被外壳挡住按不到，
-    // 现改到圆内底部：两键各 78x22，四角最远 r≈155 < 安全线 158。
-    fillRoundRect( 96, 288, 78, 22, 8, C_SLATE);
-    drawBtnText(135, 288, 22, "< BACK", C_WHITE);
-    fillRoundRect(186, 288, 78, 22, 8, C_ORANGE_D);
-    drawBtnText(225, 288, 22, "RESCAN", C_WHITE);
+    // v2.8：底部只留 RESCAN，回设置页靠左右滑（返回键撤掉了）
+    fillRoundRect(141, 288, 78, 22, 8, C_ORANGE_D);
+    drawBtnText(180, 288, 22, "RESCAN", C_WHITE);
   } else {
     char sdisp[34];
     fitText(sdisp, sizeof(sdisp), gWifiSSID.c_str(), 16, 186);   // y=56 处圆内可用宽度 ≈196，留边
@@ -2213,11 +2217,9 @@ static void drawSliderRow(int rowY, const char *label, int val, int vmax, const 
 
 static void renderSettings() {
   clear(C_DARK2);
-  // 标题行从 y=86 提到 68：5 行卡片从 y=96 起，标题留在 86 会被第一行盖住。
-  // 返回键同步上移到 (92,76)、半径 18→15（圆内 y=61 处可用 x 只到 107）。
-  drawText(180, ST_BACK_CY - 8, "SETTINGS", C_WHITE, 16, 1, 1);
-  fillRoundRect(ST_BACK_CX - ST_BACK_R, ST_BACK_CY - 14, ST_BACK_R * 2, 28, 8, C_SLATE);
-  drawBtnText(ST_BACK_CX, ST_BACK_CY - 14, 28, "<", C_WHITE, 16);
+  // 标题行 y=68：5 行卡片从 y=96 起，标题留在 86 会被第一行盖住。
+  // v2.8：左上角那颗 "<" 撤掉，标题独占一行；退出设置靠左右/下/上滑。
+  drawText(180, 68, "SETTINGS", C_WHITE, 16, 1, 1);
 
   // ── 第 1 行：Wi-Fi（显示当前 SSID / 状态，点击进配网页）
   fillRoundRect(ST_RX, ST_R1, ST_RW, ST_RH, 10, COL(28, 36, 44));
@@ -2276,8 +2278,7 @@ static void renderCityList() {
   clear(C_DARK2);
   drawText(180, 36, "CITY / WEATHER", C_WHITE, 12, 1, 1);
   drawText(180, 54, "TAP TO SET LOCATION", C_GREY, 12, 1, 1);
-  fillRoundRect(ST_BACK_CX - ST_BACK_R, ST_BACK_CY - 14, ST_BACK_R * 2, 28, 8, C_SLATE);
-  drawBtnText(ST_BACK_CX, ST_BACK_CY - 14, 28, "<", C_WHITE, 16);
+  // v2.8：左上 "<" 与底部 "< BACK" 都撤掉，滑一下回设置页（子页只关自己这层）
   int pages = (CITY_COUNT + CITY_ROWS - 1) / CITY_ROWS;
   if (gCityScroll >= pages) gCityScroll = 0;
   for (int r = 0; r < CITY_ROWS; r++) {
@@ -2295,18 +2296,14 @@ static void renderCityList() {
   }
   char pg[12]; snprintf(pg, sizeof(pg), "%d/%d", gCityScroll + 1, pages);
   drawText(180, 268, pg, C_GREY, 12, 1, 1);
-  fillRoundRect(96, 288, 78, 22, 8, C_SLATE);
-  drawBtnText(135, 288, 22, "< BACK", C_WHITE);
-  fillRoundRect(186, 288, 78, 22, 8, C_ORANGE_D);
-  drawBtnText(225, 288, 22, "MORE >", C_WHITE);
+  fillRoundRect(141, 288, 78, 22, 8, C_ORANGE_D);
+  drawBtnText(180, 288, 22, "MORE >", C_WHITE);
 }
 
 static bool cityListTap(int x, int y) {
   int pages = (CITY_COUNT + CITY_ROWS - 1) / CITY_ROWS;
-  if (hit(x, y, ST_BACK_CX, ST_BACK_CY, ST_BACK_R)) { gCityList = false; render(); return true; }
   if (y >= 284 && y <= 312) {
-    if (x >= 96 && x <= 174)  { gCityList = false; render(); return true; }
-    if (x >= 186 && x <= 264) { gCityScroll = (gCityScroll + 1) % pages; render(); return true; }
+    if (x >= 141 && x <= 219) { gCityScroll = (gCityScroll + 1) % pages; render(); return true; }
     return true;
   }
   for (int r = 0; r < CITY_ROWS; r++) {
@@ -2337,9 +2334,8 @@ static void volumeStep(int d) {
   Serial.printf("[UI] volume -> %d/21\n", gVolume);
 }
 
-// 任意页面从屏幕上半部往下长拉 -> 设置页；设置页往上推或点左上 < 返回原页。
+// 任意页面从屏幕上半部往下长拉 -> 设置页；退出设置靠手势（左右/下/上滑都回原页）。
 // 只认「起点靠上 + 下拉够长 + 明显竖向」的手势，26px 的普通下滑仍是翻页。
-static Page gSettingsFrom = P_ANALOG;
 #define PULL_START_Y  125      // 起点 y 上限（圆屏上半部）
 #define PULL_MIN_DY   55       // 下拉距离下限
 static void enterSettings() {
@@ -2354,14 +2350,14 @@ static void enterSettings() {
 static void exitSettings() {
   gCityList = false;
   curPage = gSettingsFrom;
+  Serial.printf("[UI] settings exit -> page %d (gesture)\n", (int)curPage);
   render();
 }
 
-// 设置页点击：返回 / 进 Wi-Fi / 亮度 -+ / 音量 -+ / 城市
+// 设置页点击：进 Wi-Fi / 亮度 -+ / 音量 -+ / 城市（返回靠手势）
 static bool settingsTap(int x, int y) {
   if (curPage != P_SETTINGS) return false;
   if (gCityList) return cityListTap(x, y);
-  if (hit(x, y, ST_BACK_CX, ST_BACK_CY, ST_BACK_R)) { exitSettings(); return true; }
   if (y >= ST_R1 && y <= ST_R1 + ST_RH) { enterWifiList(); render(); return true; }
   if (y >= ST_R2 && y <= ST_R2 + ST_RH) {
     if (hit(x, y, ST_BTN_MINUS_CX, ST_R2 + 21, ST_BTN_R + 6))      brightStep(-BRIGHT_STEP);
@@ -2552,16 +2548,10 @@ static void renderApps() {
 }
 
 // ================================================================ v1.0 功能页公共件
-// 返回键放标题栏左侧空白 (106,62) r16：距圆心 sqrt(74^2+118^2)=139 +16=155 < 158 安全区。
-// 旧版 (48,62) 距圆心 177 被外壳挡住；(90,88) 虽在安全区却正好压住 y>=76 的转写/待办首行
-// ——离线预览 v2 抓到的回归。现位置在分隔线以上、正文 y>=76 以下都不重叠。
-// 单词页三颗词书按钮已右移到 cx=145/197/249, y=64，给这颗返回键让位。
-// FB_BACK_* 已移到 ui_kit.h（头文件 wordTap 也要用，定义在这里会编译失败）
-static void drawFeatureBack() {
-  fillCircle(FB_BACK_CX, FB_BACK_CY, FB_BACK_R, COL(38, 46, 58));
-  circle(FB_BACK_CX, FB_BACK_CY, FB_BACK_R, COL(78, 90, 110), 2);
-  drawBtnText(FB_BACK_CX, FB_BACK_CY - 8, 16, "<", C_WHITE, 16);
-}
+// v2.8：页内返回键整体撤掉（用户口径：手势左右默认返回即可）。原来那颗
+// (106,62) r16 的 "<" 在九个功能页上都占着标题栏左侧的黄金位置，且和
+// 「左右滑 = 回上一层」重复。现在返回只有一条路：左右/下滑回上一层、上滑回表盘，
+// 子页（期限/选词书/城市/录音列表/小智绑定/曲库）滑一下只关自己那层。
 
 // UTF-8 安全的居中自动换行：按整字符累加像素宽，超宽断到下一行。
 // x = 行中心；y = 第一行字形顶部；返回实际画了几行。
@@ -2772,7 +2762,8 @@ static void renderMemo() {
     drawText(180, 144, "自动记进待办清单", COL(100, 130, 115), 16, 1, 1);
   }
   drawVoiceButton(138, 250, 44, "录音", AVM_MEMO);
-  uiBtn(242, 250, 36, gMemoBackToTodo ? "返回" : "清单", UI_G);
+  // 这颗是"跳到待办清单"的功能键，不是返回键 —— 文案统一成"清单"，两种入口都对
+  uiBtn(242, 250, 36, "清单", UI_G);
 }
 
 static void renderPet()   { petRender(); }
@@ -2808,8 +2799,8 @@ static void renderRecList() {
   }
   char pg[12]; snprintf(pg, sizeof(pg), "%d/%d", gRecListPage + 1, pages);
   drawText(180, 248, pg, C_GREY, 16, 1, 1);
-  uiBtn(112, 288, 26, "返回", UI_N);
-  uiBtn(248, 288, 26, "翻页", UI_N);
+  // v2.8：返回键撤掉（滑一下关浮层），只留翻页；只有一页时连这颗也不画
+  if (pages > 1) uiBtn(180, 288, 28, "翻页", UI_N);
 }
 
 static bool recListTap(int x, int y);
@@ -2895,8 +2886,7 @@ static void renderRecorder() {
 
 static bool recListTap(int x, int y) {
   int pages = (gRecN + REC_ROWS - 1) / REC_ROWS; if (pages < 1) pages = 1;
-  if (hit(x, y, 112, 288, 34)) { gRecListOpen = false; render(); return true; }
-  if (hit(x, y, 248, 288, 34)) { gRecListPage = (gRecListPage + 1) % pages; render(); return true; }
+  if (pages > 1 && hit(x, y, 180, 288, 34)) { gRecListPage = (gRecListPage + 1) % pages; render(); return true; }
   for (int r = 0; r < REC_ROWS; r++) {
     int ry = 90 + r * 38;
     if (x >= 66 && x <= 294 && y >= ry && y <= ry + 32) {
@@ -3012,6 +3002,11 @@ static void renderTodoDeadline() {
 // ================================================================ 渲染调度
 static void render() {
   if (gLocked) return;           // 息屏中：不画任何东西（背光已关，画了也看不见，白耗 CPU）
+  // v2.8：进入背单词页自动读一遍当前词（开关开时）。只在页面切换那一帧触发，
+  // 之后 250ms 的常规重绘不会再发音。
+  static Page gLastRenderPage = P_ANALOG;
+  if (curPage == P_WORDS && gLastRenderPage != P_WORDS) wordPronounce();
+  gLastRenderPage = curPage;
   switch (curPage) {
     case P_ANALOG:   if (gFace) renderDigital(); else renderAnalog(); break;   // 主界面两块表盘
     case P_DIGITAL:  renderDigital(); break;   // 串口 PAGE 1 保留（UI 上已并入主界面）
@@ -3030,7 +3025,7 @@ static void render() {
     default: break;
   }
   // v0.15：模拟表盘上的齿轮 / 锁键两个虚拟按钮全部去掉，表盘保持干净。
-  //   - 设置：任意页面从上半部往下拉呼出（设置页上推或点 < 返回）
+  //   - 设置：表盘上半部往下拉呼出，设置页任意方向滑动退出
   //   - 锁屏：只按右上实体 BOOT 键（GPIO0）切换；息屏后同样只由该键唤醒，
   //           触摸一律忽略（v0.17 防误触，不再"碰一下就亮"）
   // 图标函数仍留在下面备用，但不再绘制、也不再注册任何命中热区。
@@ -3259,7 +3254,8 @@ bool cfgExtra(const String &raw) {
     return true;
   }
   if (up == "PET" || up.startsWith("PETSET ")) { petCmd(raw); return true; }
-  if (up == "WORD" || up == "WORDRESET") { wordCmd(raw); return true; }
+  if (up == "WORD" || up == "WORDRESET" || up == "WORDDUE" || up.startsWith("WORDSET ") ||
+      up == "PRON" || up.startsWith("PRON ")) { wordCmd(raw); return true; }
   if (up == "MIC" || up == "MICPIN" || up.startsWith("MICTEST")) { micCmd(raw); return true; }
   // 录音机验收：REC / RECLIST / RECREC [秒] / RECPLAY [n] / RECSTOP / RECMIN [n] / RECDEL [n]
   if (up == "REC" || up == "RECLIST" || up.startsWith("RECREC") || up.startsWith("RECPLAY")
@@ -3583,10 +3579,7 @@ static void handleTap(int x, int y) {
       break;
     case P_MUSIC:
       if (gMusicList) {                         // ---- 曲库浮层 ----
-        if (x >= 96 && x <= 174 && y >= 288 && y <= 310) {
-          gMusicList = false; render(); return;
-        }
-        if (x >= 186 && x <= 264 && y >= 288 && y <= 310) {
+        if (x >= 141 && x <= 219 && y >= 288 && y <= 310) {
           int n = audioCount((int)audioSource());
           int pages = (n + MUSIC_LIST_ROWS - 1) / MUSIC_LIST_ROWS; if (pages < 1) pages = 1;
           gMusicPage = (gMusicPage + 1) % pages; render(); return;
@@ -3693,11 +3686,6 @@ static void handleTap(int x, int y) {
       }
       break;
     case P_CHAT:
-      if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
-        if (gXzPageOpen) gXzPageOpen = false;
-        else curPage = P_APPS;
-        render(); return;
-      }
       if (gXzPageOpen) {
         auto state = gXzState.load();
         if (hit(x, y, 180, 260, 36) && state != XzBinding::Waiting) xzRequestBinding();
@@ -3712,12 +3700,6 @@ static void handleTap(int x, int y) {
       if (hit(x, y, 180, 288, 44)) { xzChatToggle(); render(); }
       break;
     case P_MEMO:
-      if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
-        // 从待办页"语音加"进来的，返回时也回清单，闭环不迷路
-        bool fromTodo = gMemoBackToTodo;
-        gMemoBackToTodo = false;
-        curPage = fromTodo ? P_TODO : P_APPS; render(); return;
-      }
       if (hit(x, y, 138, 250, 52)) { aiVoiceToggle(AVM_MEMO); render(); }
       else if (hit(x, y, 242, 250, 42)) {
         gMemoBackToTodo = false; curPage = P_TODO; gTodoPage = 0; render();
@@ -3725,9 +3707,6 @@ static void handleTap(int x, int y) {
       break;
     case P_RECORDER:
       if (gRecListOpen) { recListTap(x, y); return; }
-      if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
-        recStopPlay(); curPage = P_APPS; render(); return;
-      }
       if (gAiState == AVS_PROCESSING) {
         if (gAiMode == AVM_MEETING && hit(x, y, 248, 292, 32)) gAiCancel.store(true);
         else showToast("语音任务进行中");
@@ -3740,11 +3719,8 @@ static void handleTap(int x, int y) {
       if (y >= 126 && y <= 176) { gRecListPage = gRecSel / REC_ROWS; gRecListOpen = true; render(); return; }
       break;
     case P_TODO: {
-      // 期限子页：返回键回清单，五颗圆键写期限
+      // 期限子页：滑动关闭（pollTouch），五颗圆键写期限
       if (gTodoDeadlineFor >= 0) {
-        if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
-          gTodoDeadlineFor = -1; render(); return;
-        }
         static const int DX[5] = {104, 180, 256, 142, 218};
         static const int DY[5] = {158, 158, 158, 236, 236};
         static const int DD[5] = {0, 1, 7, 30, -1};
@@ -3756,10 +3732,6 @@ static void handleTap(int x, int y) {
           }
         }
         break;
-      }
-      if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
-        gMemoLastAdded = 0; gTodoNewFrom = -1;        // 离开清单，清掉"新"高亮
-        curPage = P_APPS; render(); return;
       }
       if (hit(x, y, 108, 285, 38)) {                   // 语音加：进备忘页，置闭环标志
         if (gAiState == AVS_RECORDING || gAiState == AVS_PROCESSING) {
@@ -3803,24 +3775,15 @@ static void handleTap(int x, int y) {
       break;
     }
     case P_WORDS:
-      // 选词书子页的返回键由 wordTap 处理（回做题页），只有做题页才回应用中心
-      if (!wordPicking && hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) {
-        curPage = P_APPS; render(); return;
-      }
       wordTap(x, y);
       break;
     case P_PET:
-      if (hit(x, y, FB_BACK_CX, FB_BACK_CY, FB_BACK_HIT)) { curPage = P_APPS; render(); return; }
       petTap(x, y);
       break;
     case P_WIFI: {
       if (gWifiState == W_LIST) {
-        // 底部 BACK：回到设置页（Wi-Fi 已收进设置里）
-        if (x >= 96 && x <= 174 && y >= 284 && y <= 314) {
-          curPage = P_SETTINGS; gWifiState = W_LIST; gWifiScroll = 0; gWifiSel = -1; render(); return;
-        }
-        // RESCAN 按钮
-        if (x >= 186 && x <= 264 && y >= 284 && y <= 314) {
+        // RESCAN 按钮（回设置页靠左右滑，见 pollTouch）
+        if (x >= 141 && x <= 219 && y >= 284 && y <= 314) {
           wifiScanStart(); render(); return;
         }
         // 网络行点选
@@ -3952,27 +3915,45 @@ static void pollTouch() {
     // 子页/浮层优先关掉，再交给导航（一次滑动只做一件事，不会"跳过一层"）
     if (ev.type != TE_TAP) {
       if (curPage == P_TODO && gTodoDeadlineFor >= 0) {
-        gTodoDeadlineFor = -1; render(); continue;
+        gTodoDeadlineFor = -1; Serial.println("[UI] subpage close -> todo"); render(); continue;
       }
       if (curPage == P_SETTINGS && gCityList) {
-        gCityList = false; render(); continue;
+        gCityList = false; Serial.println("[UI] subpage close -> settings"); render(); continue;
       }
       if (curPage == P_RECORDER && gRecListOpen) {
-        gRecListOpen = false; render(); continue;
+        gRecListOpen = false; Serial.println("[UI] subpage close -> recorder"); render(); continue;
       }
       if (curPage == P_WORDS && wordPicking) {
-        wordPicking = false; render(); continue;
+        wordPicking = false; Serial.println("[UI] subpage close -> words"); render(); continue;
       }
       // 小智绑定子页：和其它子页同一约定，滑一下只关子页，不跳层
       if (curPage == P_CHAT && gXzPageOpen) {
-        gXzPageOpen = false; render(); continue;
+        gXzPageOpen = false; Serial.println("[UI] subpage close -> chat"); render(); continue;
       }
     }
-    // 曲库浮层里滑动只翻曲目分组，不做十字翻页（和 Wi-Fi 列表滚动同一套约定）
+    // v2.8：设置页 / 配网页不在"应用中心"那一层，滑动直接回上一层。
+    // 不拦的话下面的 navigate 会把用户甩到应用中心（设置来自表盘、配网来自设置）。
+    if (ev.type != TE_TAP && curPage == P_SETTINGS) { exitSettings(); continue; }
+    if (ev.type != TE_TAP && curPage == P_WIFI) {
+      if (gWifiState == W_KEY) {                        // 键盘态：任意滑动 = 取消输入回列表
+        gWifiState = W_LIST; gWifiPassFromBook = false;
+        Serial.println("[UI] wifi keypad canceled (gesture)");
+        render(); continue;
+      }
+      if (ev.type == TE_LEFT || ev.type == TE_RIGHT) {  // 列表态：上下滑留给列表滚动
+        curPage = P_SETTINGS; gWifiScroll = 0; gWifiSel = -1;
+        Serial.println("[UI] wifi -> settings (gesture)");
+        render(); continue;
+      }
+    }
+    // 曲库浮层：左右滑 = 退出（返回键已撤），上下滑 = 翻页
     if (curPage == P_MUSIC && gMusicList && ev.type != TE_TAP) {
+      if (ev.type == TE_LEFT || ev.type == TE_RIGHT) {
+        gMusicList = false; Serial.println("[UI] library closed (gesture)"); render(); continue;
+      }
       int n = audioCount((int)audioSource());
       int pages = (n + MUSIC_LIST_ROWS - 1) / MUSIC_LIST_ROWS; if (pages < 1) pages = 1;
-      bool fwd = (ev.type == TE_UP || ev.type == TE_RIGHT);
+      bool fwd = (ev.type == TE_UP);
       gMusicPage = (gMusicPage + (fwd ? 1 : pages - 1)) % pages;
       Serial.printf("[UI] library page -> %d/%d\n", gMusicPage + 1, pages);
       render();

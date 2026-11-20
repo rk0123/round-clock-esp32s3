@@ -9,7 +9,6 @@
 static void showToast(const char *s);
 static bool hit(int x, int y, int cx, int cy, int r);
 static void render();
-static void drawFeatureBack();   // main.cpp 功能页公共返回键
 static void drawBtnText(int x, int boxY, int boxH, const char *s, uint16_t col,
                         int font, int scale, int align);
 
@@ -194,7 +193,7 @@ static void petRender() {
   fillCircle(CX, CY, R, COL(126, 214, 244));           // 天空
   petBand(CX, CY, R, 156, 360, COL(122, 196, 92));     // 草地（逐行裁到圆内）
   petBand(CX, CY, R, 155, 157, COL(92, 158, 70));      // 地平线
-  drawFeatureBack();
+  // v2.8：不再画返回键，退出靠左右/上滑手势（见 main.cpp navigate）
 
   // 太阳（右侧中部，避开顶部状态条，圆 + 十字光芒全在屏内）
   fillCircle(288, 132, 12, COL(255, 224, 84));

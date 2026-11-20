@@ -197,20 +197,15 @@ static void wordPronounce(bool force = false) {
   audioPlayUrl(url);
 }
 
-// 右上角小喇叭：开=黄绿声波，关=灰色加一道斜杠
+// 右上角小喇叭：不要外圈。开=亮黄喇叭+声波，关=灰喇叭（点一下切换，热区仍保留 18px）
 static void drawPronIcon(int cx, int cy) {
   wordPronLoad();
   uint16_t c = gWordPronOn ? C_YELLOW : C_GREY;
-  fillCircle(cx, cy + 1, 16, mix(COL(20, 26, 34), C_DARK, 90));
-  fillCircle(cx, cy, 16, gWordPronOn ? COL(34, 62, 50) : COL(38, 46, 58));
-  circle(cx, cy, 16, gWordPronOn ? C_GREEN : COL(78, 90, 110), 2);
   fillRect(cx - 8, cy - 3, 4, 6, c);
   fillTri(cx - 4, cy - 3, cx + 2, cy - 8, cx + 2, cy + 8, c);
   if (gWordPronOn) {
     arcRing(cx + 3, cy, 8, 50, 130, 2, c);
     arcRing(cx + 3, cy, 12, 50, 130, 2, c);
-  } else {
-    line(cx + 3, cy - 6, cx + 10, cy + 6, COL(220, 110, 110), 2);
   }
 }
 

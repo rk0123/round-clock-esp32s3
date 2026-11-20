@@ -253,7 +253,7 @@ static void wordRender() {
     int pct = total ? (wordRight * 100 / total) : 0;
     char s3[24]; snprintf(s3, sizeof(s3), "%d%%", pct);
     drawText(180, 222, s3, pct >= 80 ? C_GREEN : C_ORANGE, 24, 1, 1);
-    uiBtn(180, 284, 28, "再来", UI_A);
+    uiBtn(180, 285, 30, "再来", UI_A);   // 与其它应用底键统一尺寸/位置
     return;
   }
 
@@ -291,8 +291,10 @@ static void wordRender() {
     }
     uiPill(OX[i] - 67, OY[i] - 21, 135, 42, tab[wordOpts[i]].cn, st);
   }
-  // 三字中文 48px 宽：r22 时在字形上下缘圆内只剩 41px，会被圆边切掉。
-  // 两态统一 r27（底部 310+27 距圆心 157 < 158 安全线），切换时按钮也不跳动。
+  // 配色与其它应用底键统一（开始=橙/次要=灰，font16）。
+  // 半径留 r27、纵向留 y=310：上面 2x2 选项占到 y=279，塞进 285 会重叠；
+  // 而 310+30=340 距圆心 160 越过 158 安全线，r27 的 337 刚好压线。
+  // 三字中文 48px 在 r27 内完整，切换也不跳动。
   uiBtn(180, 310, 27, wordPicked ? "下一题" : "跳过", wordPicked ? UI_A : UI_N);
 }
 
@@ -342,7 +344,7 @@ static void wordTap(int x, int y) {
   // 主页面：顶部「当前 xx」胶囊（(128,66) 104x30，热区外扩 6px，手指好按）
   if (x >= 122 && x <= 238 && y >= 60 && y <= 102) { wordPicking = true; render(); return; }
   if (wordPos >= wordQueueN) {
-    if (hit(x, y, 180, 284, 34)) { wordReset(false); render(); }
+    if (hit(x, y, 180, 285, 38)) { wordReset(false); render(); }
     return;
   }
   // 点英文单词本身 = 重播（手动点不受开关限制）

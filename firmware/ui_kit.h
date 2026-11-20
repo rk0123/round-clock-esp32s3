@@ -30,7 +30,8 @@ static void uiPage(const char *title, uint16_t ring = 0, bool divider = true) {
   clear(C_DARK);
   fillCircle(180, 180, 172, UI_PAGE_BG);
   circle(180, 180, 168, ring ? ring : UI_RING, 2);
-  drawText(180, 36, title, C_CREAM, 16, 1, 1);
+  // 标题升到 FONT24（24px，字库已补齐全部标题字）：y=30 底边 54，分隔线 64 留 10px。
+  drawText(180, 30, title, C_CREAM, 24, 1, 1);
   if (divider) line(132, 64, 240, 64, UI_DIV);
 }
 

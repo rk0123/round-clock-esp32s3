@@ -249,6 +249,12 @@ static int  gNetEnc[16];
 // 第 5 行城市卡：y=282 时圆内可用 x 只有 62..298，所以只做 236 宽
 #define ST_CITY_X  62
 #define ST_CITY_W  236
+// 第 6 行：小智绑定入口（非常用功能从主页面挪进来）。收紧到 152x28：
+// 四角最远 (104,314) 距圆心 sqrt(76^2+134^2)=154 < 158 安全线。
+#define ST_XZ_X    104
+#define ST_XZ_W    152
+#define ST_R6      286
+#define ST_R6H     28
 #define ST_BTN_MINUS_CX 238
 #define ST_BTN_PLUS_CX  290
 #define ST_BTN_R   15
@@ -2256,6 +2262,17 @@ static void renderSettings() {
   drawText(ST_CITY_X + 16, ST_R5 + 11, "CITY", C_WHITE, 12, 1, 0);
   drawBtnText(ST_CITY_X + ST_CITY_W - 24, ST_R5, ST_RH, CITIES[gCityIdx].name, C_GREEN, 16, 1, 2);
   drawText(ST_CITY_X + ST_CITY_W - 12, ST_R5 + 11, ">", C_GREY, 12, 1, 1);
+
+  // ── 第 6 行：小智绑定状态（点击进绑定子页查询/获取绑定码）
+  XzBinding bst = gXzState.load();
+  const char *bz = bst == XzBinding::Bound ? "已绑定" :
+                   bst == XzBinding::Waiting ? "待确认" : "去绑定";
+  uint16_t bc = bst == XzBinding::Bound ? C_GREEN :
+                bst == XzBinding::Waiting ? C_YELLOW : C_GREY;
+  fillRoundRect(ST_XZ_X, ST_R6, ST_XZ_W, ST_R6H, 9, COL(28, 36, 44));
+  drawText(ST_XZ_X + 14, ST_R6 + 7, "XIAOZHI", C_WHITE, 12, 1, 0);
+  drawBtnText(ST_XZ_X + ST_XZ_W - 12, ST_R6, ST_R6H, bz, bc, 16, 1, 2);
+  drawText(ST_XZ_X + ST_XZ_W - 10, ST_R6 + 7, ">", C_GREY, 12, 1, 1);
 }
 
 // ---------------------------------------------------------------- 天气城市选择浮层
@@ -2334,6 +2351,9 @@ static void volumeStep(int d) {
   Serial.printf("[UI] volume -> %d/21\n", gVolume);
 }
 
+// 小智绑定子页开关：设置页第 6 行和小智页都要用，定义必须在 settingsTap 之前。
+static bool gXzPageOpen = false;
+
 // 任意页面从屏幕上半部往下长拉 -> 设置页；退出设置靠手势（左右/下/上滑都回原页）。
 // 只认「起点靠上 + 下拉够长 + 明显竖向」的手势，26px 的普通下滑仍是翻页。
 #define PULL_START_Y  125      // 起点 y 上限（圆屏上半部）
@@ -2380,6 +2400,13 @@ static bool settingsTap(int x, int y) {
   if (y >= ST_R5 && y <= ST_R5 + ST_RH) {
     gCityList = true;
     gCityScroll = gCityIdx / CITY_ROWS;
+    render(); return true;
+  }
+  if (y >= ST_R6 && y <= ST_R6 + ST_R6H) {
+    // 绑定入口：跳到小智页并打开绑定子页（主页面已无绑定键）
+    curPage = P_CHAT; gXzPageOpen = true;
+    XzBinding bst = gXzState.load();
+    if (bst != XzBinding::Waiting && bst != XzBinding::Bound) xzRequestBinding();
     render(); return true;
   }
   return true;   // 设置页吞掉其余点击，避免误触翻页
@@ -2580,21 +2607,44 @@ static int drawWrapText(const char *s, int x, int y, int maxW, int lineH,
   return lines;
 }
 
-// 三个语音页共用的大圆键：IDLE「说话/录音」→ RECORDING「停止」→ PROCESSING「识别中」
+// ---------- 四个应用底部圆键统一规范 ----------
+// 小智 / 备忘 / 录音 / 待办全部用同一排、同一尺寸、同一套配色语义：
+//   y=285；三槽 x=108(左)/180(中)/252(右)；r=30；字号 16。
+//   几何：最外侧槽 (108,285) 距圆心 127，+r30 = 157 < 158 安全线。
+//   配色只按语义取，不再每页自选：
+//     UI_A 橙 = 开始（说话 / 录音 / 语音加 / 查询）
+//     UI_G 绿 = 确认或正向（清单 / 回放 / 说完）
+//     UI_D 红 = 停止或危险（停止 / 打断 / 清空）
+//     UI_N 灰 = 次要（纪要 / 翻页 / 取消 / 绑定）
+#define APP_BTN_Y    285
+#define APP_BTN_R    30
+#define APP_BTN_L    108
+#define APP_BTN_C    180
+#define APP_BTN_RR   252
+#define APP_BTN_HIT  38
+
+// 等待提示：按钮外圈三段绿色流动弧，代替原来那根突兀的电平横条。
+// 三段 62° 弧随 millis() 顺时针转。半径要按槽位收敛，否则侧槽会画出安全区：
+//   中槽 (180,285) 距圆心 105：可用 r+5=35 → 140 < 158；
+//   侧槽 (108/252,285) 距圆心 127：只能用 r-6=24 → 151 < 158。
+static void drawWaitRing(int cx, int cy, int r, uint16_t col = C_GREEN) {
+  const bool center = (cx == APP_BTN_C);
+  const int rr = center ? r + 5 : r - 6;
+  const int base = (int)((millis() / 80) % 360);
+  for (int i = 0; i < 3; i++) {
+    int a = base + i * 120;
+    arcRing(cx, cy, rr, a, a + 62, 3, col);
+  }
+}
+
+// 三个语音页共用的主圆键：IDLE「录音」→ RECORDING「停止」→ PROCESSING「取消」。
+// 等待时按钮外圈转绿弧，不再画电平横条；空格留白比伪进度条干净。
 static void drawVoiceButton(int cx, int cy, int r, const char *idleLabel, AiVoiceMode mode) {
   bool rec = gAiState == AVS_RECORDING && !gAiRecToFile && gAiMode == mode;
   bool proc = gAiState == AVS_PROCESSING && gAiMode == mode;
   const char *lab = rec ? "停止" : proc ? (gAiCancel.load() ? "取消中" : "取消") : idleLabel;
-  uiBtn(cx, cy, r, lab, rec ? UI_D : proc ? UI_N : UI_A, 24);
-  if (rec) {
-    // 电平条画在圆键**内部下方**（不放圆外）：录音机键已在 y=288，
-    // 若按老写法 cy+r+22 会到 y=350，四角距圆心 188 远超安全区 158。
-    int bw = (int)(r * 1.6);
-    int by = cy + 10;
-    fillRoundRect(cx - bw / 2, by, bw, 6, 3, COL(70, 30, 30));
-    int lv = constrain(gAiRms / 8, 0, 100);
-    if (lv > 0) fillRoundRect(cx - bw / 2, by, bw * lv / 100, 6, 3, C_GREEN);
-  }
+  uiBtn(cx, cy, r, lab, rec ? UI_D : proc ? UI_N : UI_A);
+  if (rec || proc) drawWaitRing(cx, cy, r);
 }
 
 // ---------------- 小智问答：语音提问 → Qwen 答复 ----------------
@@ -2603,8 +2653,6 @@ static void drawVoiceButton(int cx, int cy, int r, const char *idleLabel, AiVoic
 static bool aiResFor(AiVoiceMode m) {
   return gAiResultOwner == m && (gAiTranscript.length() || gAiResult.length());
 }
-static bool gXzPageOpen = false;
-
 static void renderXzBinding() {
   uiPage("小智绑定", C_ORANGE_D);
   XzBinding state = gXzState.load();
@@ -2641,7 +2689,7 @@ static void renderXzBinding() {
       break;
   }
   if (state != XzBinding::Waiting && state != XzBinding::Fetching)
-    uiBtn(180, 260, 34, "查询", UI_A);
+    uiBtn(APP_BTN_C, APP_BTN_Y, APP_BTN_R, "查询", UI_A);
 }
 
 // 显示前把首尾的句读符号剪掉。drawWrapText 按像素断行，最后一个"？"经常
@@ -2710,20 +2758,19 @@ static void renderChat() {
     drawWrapText(err.c_str(), 180, 196, 250, 18, 2, COL(240, 150, 140), 16);
   }
 
-  // ---- 底部主键：说话 / 说完 / 打断 ----
+  // ---- 底部主键：说话 / 说完 / 打断（统一网格 + 语义配色）----
   const char *btn = "说话";
-  uint16_t btnCol = C_ORANGE;
-  if (st == XC_LISTENING) { btn = "说完"; btnCol = COL(120, 210, 255); }
-  else if (st == XC_SPEAKING) { btn = "打断"; btnCol = C_GREEN; }
-  else if (st == XC_THINKING || st == XC_CONNECTING) { btn = "取消"; btnCol = COL(120, 132, 148); }
-  uiBtn(180, 288, 36, btn, btnCol);
-  // 收音电平：说话时给一条小弧，让人知道"它在听"
-  if (st == XC_LISTENING) {
-    const int lv = constrain(gXzLevel.load(), 0, 100);
-    if (lv > 2) fillRoundRect(180 - 40, 242, 80 * lv / 100, 4, 2, COL(120, 210, 255));
+  int bstyle = UI_A;                       // 开始 = 橙
+  if (st == XC_LISTENING)      { btn = "说完"; bstyle = UI_G; }   // 确认 = 绿
+  else if (st == XC_SPEAKING)  { btn = "打断"; bstyle = UI_D; }   // 停止 = 红
+  else if (st == XC_THINKING || st == XC_CONNECTING) {
+    btn = "取消"; bstyle = UI_N;                                  // 次要 = 灰
   }
-  // 会话进行中不画"绑定"：那一块要留给多行答复，按钮会压到最后一行上
-  if (!active) uiBtn(266, 250, 22, "绑定", UI_G);
+  uiBtn(APP_BTN_C, APP_BTN_Y, APP_BTN_R, btn, bstyle);
+  // 等待时外圈绿弧流动（不再画电平横条）
+  if (st == XC_LISTENING || st == XC_THINKING || st == XC_CONNECTING)
+    drawWaitRing(APP_BTN_C, APP_BTN_Y, APP_BTN_R);
+  // 绑定键已挪进设置页第 6 行：主页只留一颗居中主键，四页布局一致。
 }
 
 // 离开小智页就收线：麦克风和网络都不该在别的页面继续跑
@@ -2761,9 +2808,9 @@ static void renderMemo() {
     drawText(180, 118, "说出要做的事", C_GREY, 16, 1, 1);
     drawText(180, 144, "自动记进待办清单", COL(100, 130, 115), 16, 1, 1);
   }
-  drawVoiceButton(138, 250, 44, "录音", AVM_MEMO);
-  // 这颗是"跳到待办清单"的功能键，不是返回键 —— 文案统一成"清单"，两种入口都对
-  uiBtn(242, 250, 36, "清单", UI_G);
+  drawVoiceButton(APP_BTN_L, APP_BTN_Y, APP_BTN_R, "录音", AVM_MEMO);
+  // 这颗是"跳到待办清单"的功能键（确认/进入 = 绿）。两键页占左/右槽，视觉对称。
+  uiBtn(APP_BTN_RR, APP_BTN_Y, APP_BTN_R, "清单", UI_G);
 }
 
 static void renderPet()   { petRender(); }
@@ -2800,7 +2847,7 @@ static void renderRecList() {
   char pg[12]; snprintf(pg, sizeof(pg), "%d/%d", gRecListPage + 1, pages);
   drawText(180, 248, pg, C_GREY, 16, 1, 1);
   // v2.8：返回键撤掉（滑一下关浮层），只留翻页；只有一页时连这颗也不画
-  if (pages > 1) uiBtn(180, 288, 28, "翻页", UI_N);
+  if (pages > 1) uiBtn(APP_BTN_C, APP_BTN_Y, APP_BTN_R, "翻页", UI_N);
 }
 
 static bool recListTap(int x, int y);
@@ -2834,12 +2881,10 @@ static void renderRecorder() {
     drawText(180, 74, "就绪", COL(150, 132, 112), 16, 1, 1);
   }
 
-  // ---- 电平条 / 进度条（y=106 高 10，x 116..244）----
-  if (rec) {
-    fillRoundRect(116, 106, 128, 10, 5, COL(40, 34, 30));
-    int lv = constrain(gAiRms / 8, 0, 100);
-    if (lv > 0) fillRoundRect(116, 106, 128 * lv / 100, 10, 5, COL(214, 96, 76));
-  } else if (play && gAudDuration > 0) {
+  // ---- 进度条（y=106 高 10，x 116..244）----
+  // 录音中的电平横条已撤：等待提示统一用录音键外圈的绿色流动弧。
+  // 这里只保留回放进度条（那是"播放到哪"，不是"等识别"）。
+  if (play && gAudDuration > 0) {
     fillRoundRect(116, 106, 128, 10, 5, COL(26, 34, 44));
     int lv = constrain((int)gAudElapsed * 100 / (int)gAudDuration, 0, 100);
     fillRoundRect(116, 106, 128 * lv / 100, 10, 5, COL(96, 160, 210));
@@ -2877,16 +2922,17 @@ static void renderRecorder() {
     drawWrapText(gAiResult.c_str(), 180, 222, 264, 18, 2, C_WHITE, 16);
   }
 
-  // ---- 三颗键：回放 / 录音 / 纪要 ----
-  uiBtn(112, 292, 24, play ? "停止" : "回放", play ? UI_D : UI_G);
-  if (rec) uiBtn(180, 286, 34, "停止", UI_D, 24);
-  else uiBtn(180, 286, 34, "录音", busy ? UI_N : UI_A, 24);
-  uiBtn(248, 292, 24, busy ? "取消" : "纪要", UI_S);
+  // ---- 三颗键：回放 / 录音 / 纪要（统一网格 + 语义配色）----
+  uiBtn(APP_BTN_L, APP_BTN_Y, APP_BTN_R, play ? "停止" : "回放", play ? UI_D : UI_G);
+  if (rec) uiBtn(APP_BTN_C, APP_BTN_Y, APP_BTN_R, "停止", UI_D);
+  else uiBtn(APP_BTN_C, APP_BTN_Y, APP_BTN_R, "录音", busy ? UI_N : UI_A);
+  uiBtn(APP_BTN_RR, APP_BTN_Y, APP_BTN_R, busy ? "取消" : "纪要", UI_N);
+  if (rec || busy) drawWaitRing(APP_BTN_C, APP_BTN_Y, APP_BTN_R);
 }
 
 static bool recListTap(int x, int y) {
   int pages = (gRecN + REC_ROWS - 1) / REC_ROWS; if (pages < 1) pages = 1;
-  if (pages > 1 && hit(x, y, 180, 288, 34)) { gRecListPage = (gRecListPage + 1) % pages; render(); return true; }
+  if (pages > 1 && hit(x, y, APP_BTN_C, APP_BTN_Y, APP_BTN_HIT)) { gRecListPage = (gRecListPage + 1) % pages; render(); return true; }
   for (int r = 0; r < REC_ROWS; r++) {
     int ry = 90 + r * 38;
     if (x >= 66 && x <= 294 && y >= ry && y <= ry + 32) {
@@ -2960,10 +3006,10 @@ static void renderTodo() {
   // 底键：语音加 / 翻页（多页时）/ 清空——统一 UI 组件。
   // r30@(108/252,292) 外缘 163 越出安全区 158 → 上移到 y=285（外缘 157），
   // 同时热区从 r+4 收到 r+2，保证手指落点仍在圆屏内。
-  uiBtn(108, 285, 30, "语音加", UI_G);
-  if (pages > 1) uiBtn(180, 285, 30, "下一页", UI_N);
+  uiBtn(APP_BTN_L, APP_BTN_Y, APP_BTN_R, "语音加", UI_A);   // 开始 = 橙
+  if (pages > 1) uiBtn(APP_BTN_C, APP_BTN_Y, APP_BTN_R, "下一页", UI_N);
   bool armed = millis() < gTodoClearArmUntil;
-  uiBtn(252, 285, 30, armed ? "再点" : "清空", UI_D);
+  uiBtn(APP_BTN_RR, APP_BTN_Y, APP_BTN_R, armed ? "再点" : "清空", UI_D);
 }
 
 // ---------------- 期限快捷选择（清单子页） ----------------
@@ -3688,33 +3734,29 @@ static void handleTap(int x, int y) {
     case P_CHAT:
       if (gXzPageOpen) {
         auto state = gXzState.load();
-        if (hit(x, y, 180, 260, 36) && state != XzBinding::Waiting) xzRequestBinding();
+        if (hit(x, y, APP_BTN_C, APP_BTN_Y, APP_BTN_HIT) && state != XzBinding::Waiting) xzRequestBinding();
         render(); return;
       }
-      if (hit(x, y, 266, 258, 29)) {
-        gXzPageOpen = true;
-        auto state = gXzState.load();
-        if (state != XzBinding::Waiting && state != XzBinding::Bound) xzRequestBinding();
-        render(); return;
-      }
-      if (hit(x, y, 180, 288, 44)) { xzChatToggle(); render(); }
+      // 主页绑定键已撤（入口在设置页第 6 行），只剩中间一颗主键
+      if (hit(x, y, APP_BTN_C, APP_BTN_Y, APP_BTN_HIT)) { xzChatToggle(); render(); }
       break;
     case P_MEMO:
-      if (hit(x, y, 138, 250, 52)) { aiVoiceToggle(AVM_MEMO); render(); }
-      else if (hit(x, y, 242, 250, 42)) {
+      if (hit(x, y, APP_BTN_L, APP_BTN_Y, APP_BTN_HIT)) { aiVoiceToggle(AVM_MEMO); render(); }
+      else if (hit(x, y, APP_BTN_RR, APP_BTN_Y, APP_BTN_HIT)) {
         gMemoBackToTodo = false; curPage = P_TODO; gTodoPage = 0; render();
       }
       break;
     case P_RECORDER:
       if (gRecListOpen) { recListTap(x, y); return; }
       if (gAiState == AVS_PROCESSING) {
-        if (gAiMode == AVM_MEETING && hit(x, y, 248, 292, 32)) gAiCancel.store(true);
+        if (gAiMode == AVM_MEETING && hit(x, y, APP_BTN_RR, APP_BTN_Y, APP_BTN_HIT))
+          gAiCancel.store(true);
         else showToast("语音任务进行中");
         break;
       }
-      if (hit(x, y, 180, 286, 42)) { recToggleRecord(); return; }
-      if (hit(x, y, 112, 292, 32)) { recTogglePlay(); render(); return; }
-      if (hit(x, y, 248, 292, 32)) { recMakeMinutes(); render(); return; }
+      if (hit(x, y, APP_BTN_C, APP_BTN_Y, APP_BTN_HIT)) { recToggleRecord(); return; }
+      if (hit(x, y, APP_BTN_L, APP_BTN_Y, APP_BTN_HIT)) { recTogglePlay(); render(); return; }
+      if (hit(x, y, APP_BTN_RR, APP_BTN_Y, APP_BTN_HIT)) { recMakeMinutes(); render(); return; }
       // 点文件名那一行 = 打开录音列表（挑别的段来回放）
       if (y >= 126 && y <= 176) { gRecListPage = gRecSel / REC_ROWS; gRecListOpen = true; render(); return; }
       break;

@@ -223,19 +223,20 @@ static void petRender() {
   drawText(CX, 246, tag, COL(30, 66, 30), 16, 1, 1);
 
   // 底部四键：统一 UI 组件
+  // 四键排成一条直线，和其它应用底键同 y=285（原来 286/294 高低不平）。
+  // r20 保留：四键 x=120..264 间距 48，放大到 r30 会互相重叠。
   static const int BTX[4] = {120, 168, 216, 264};
-  static const int BTY[4] = {286, 294, 294, 286};
+  static const int BTY = 285;
   static const char *const BTL[4] = {"食", "玩", "睡", "洗"};
   for (int i = 0; i < 4; i++)
-    uiBtn(BTX[i], BTY[i], 20, BTL[i], (i == 2 && pet.sleeping) ? UI_S : UI_N);
+    uiBtn(BTX[i], BTY, 20, BTL[i], (i == 2 && pet.sleeping) ? UI_S : UI_N);
 }
 
 static void petTap(int x, int y) {
   petTick();
   static const int BTX[4] = {120, 168, 216, 264};
-  static const int BTY[4] = {286, 294, 294, 286};
   for (int i = 0; i < 4; i++) {
-    if (!hit(x, y, BTX[i], BTY[i], 26)) continue;
+    if (!hit(x, y, BTX[i], 285, 26)) continue;
     if (pet.dead) {
       // 死后四颗键都变复活：重新给一组健康初值
       pet.dead = 0; pet.sick = 0; pet.hunger = 70; pet.mood = 75;

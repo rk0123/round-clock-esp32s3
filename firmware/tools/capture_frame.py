@@ -81,28 +81,88 @@ def grab(s, tries=5):
             print("  抓帧超时，重试 %d" % attempt)
             continue
         i = b.index(b"===FB_BEGIN===") + len(b"===FB_BEGIN===\n")
-        while len(b) - i < FBSZ:
-            d = s.read(65536)
-            if d:
-                b += d
-                t0 = time.time()
-            elif time.time() - t0 > 10:
-                break
-        if len(b) - i < FBSZ:
-            print("  数据不足，重试 %d" % attempt)
-            continue
-        fb = b[i:i + FBSZ]
-        # 校验尾部标记：紧跟帧数据的必须是 ===FB_END===
-        tail = b[i + FBSZ:]
-        t1 = time.time()
-        while b"===FB_END===" not in tail and len(tail) < 64 and time.time() - t1 < 3:
-            d = s.read(64)
-            if d:
-                tail += d
-        if b"===FB_END===" in tail:
+        fb = _read_chunked(s, b, i)
+        if fb is not None:
             return fb
-        print("  帧流被日志污染（尾部=%r），重试 %d" % (tail[:40], attempt))
+        print("  帧流校验失败，重试 %d" % attempt)
     return None
+
+
+CHUNK = 8192
+
+
+def _read_chunked(s, buf, i):
+    """按 "B<idx>\\n" 块头重组帧数据。
+
+    固件把 259200 字节拆成 32 个 8KB 块，每块前面打一行块头。好处是串口里
+    混进来的日志行（音频库是直接 Serial.print 的，屏蔽不掉）可以整行跳过：
+    读到不像块头的行就丢掉，然后继续找下一个块头 —— 错位不会传染到整幅图。
+    旧固件没有块头，这时退回"定长读 + 尾部必须是 FB_END"的老路径。
+    """
+    data = bytearray(FBSZ)
+    got = bytearray(FBSZ)          # 每块是否已收到
+    buf = bytearray(buf)
+    pos = i
+    log_lines = 0
+
+    def need(n, timeout=15.0):
+        nonlocal buf
+        t0 = time.time()
+        while len(buf) - pos < n:
+            d = s.read(max(1, n - (len(buf) - pos)))
+            if d:
+                buf += d
+                t0 = time.time()
+            elif time.time() - t0 > timeout:
+                return False
+        return True
+
+    while True:
+        # 读一行
+        t0 = time.time()
+        while True:
+            nl = buf.find(b"\n", pos)
+            if nl >= 0:
+                break
+            d = s.read(256)
+            if d:
+                buf += d
+                t0 = time.time()
+            elif time.time() - t0 > 15.0:
+                return None
+        line = bytes(buf[pos:nl]).strip()
+        pos = nl + 1
+        if line.startswith(b"===FB_END"):
+            return None                      # 块没收齐就结束了
+        if not (line.startswith(b"B") and line[1:].isdigit()):
+            log_lines += 1                   # 日志行，跳过
+            if log_lines > 200:
+                return None
+            continue
+        idx = int(line[1:])
+        if idx * CHUNK >= FBSZ:
+            return None
+        n = min(CHUNK, FBSZ - idx * CHUNK)
+        if not need(n):
+            return None
+        data[idx * CHUNK: idx * CHUNK + n] = buf[pos: pos + n]
+        got[idx] = 1
+        pos += n
+        if idx * CHUNK + n >= FBSZ:
+            break
+
+    # 尾部必须紧跟 FB_END（允许中间夹日志行）
+    t0 = time.time()
+    while b"===FB_END===" not in bytes(buf[pos:]):
+        d = s.read(256)
+        if d:
+            buf += d
+            t0 = time.time()
+        elif time.time() - t0 > 3.0:
+            return None
+    if sum(got) != (FBSZ + CHUNK - 1) // CHUNK:
+        return None                          # 有块丢失
+    return bytes(data)
 
 
 def save(fb, path):

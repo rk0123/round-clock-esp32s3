@@ -27,6 +27,9 @@ void radialGradientV(int y0, int y1, uint16_t top, uint16_t bottom);
 // font: 12 / 16 / 24（1-bit 点阵）；scale: 1..4；align 0=left 1=center 2=right
 int textWidth(const char *s, int font, int scale);
 int drawText(int x, int y, const char *s, uint16_t color, int font, int scale, int align = 0);
+// 只画落在 [x0,x1] 竖条内的像素（走马灯用）。align 固定左对齐，返回整串宽度。
+int drawTextClip(int x, int y, const char *s, uint16_t color, int font, int scale,
+                 int x0, int x1);
 
 // 4-bit 抗锯齿数字：由 44x64 母版双线性缩放而来，alpha 混合，不再有 1-bit 放大锯齿。
 // drawBigText  : 5/4 放大 -> 55x80 字形，墨迹约 57px 高（电子表盘时间 / 番茄钟）

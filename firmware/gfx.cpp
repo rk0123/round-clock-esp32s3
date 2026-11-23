@@ -226,6 +226,46 @@ int textWidth(const char *s, int font, int scale) {
   return w;
 }
 
+// v3.1：把一行字裁在 [x0,x1] 竖条里画。setPixel 只裁屏幕边界，长文本在圆屏上
+// 会直接溢出到圈外（待办条目 / 待授权命令行就是这样"后面的看不到"）。
+// 走马灯靠它把文字限制在列表可视区内。align 只支持 0：滚动起点由调用者给，
+// 若在这里居中，文字每滚一像素都会重新居中，整行会抖。
+int drawTextClip(int x, int y, const char *s, uint16_t color, int font, int scale,
+                 int x0, int x1) {
+  int total = textWidth(s, font, scale);
+  const int size = (font == 12) ? 12 : (font == 16) ? 16 : 24;
+  const int rowb = (font == 12) ? FONT12_ROW_BYTES
+                 : (font == 16) ? FONT16_ROW_BYTES : FONT24_ROW_BYTES;
+  const uint8_t *tab = (font == 12) ? &FONT12_GLYPHS[0][0]
+                     : (font == 16) ? &FONT16_GLYPHS[0][0] : &FONT24_GLYPHS[0][0];
+  if (x0 < 0) x0 = 0;
+  if (x1 > SCREEN_W - 1) x1 = SCREEN_W - 1;
+  int ox = x;
+  uint32_t cp;
+  while (*s) {
+    int n = utf8Next(s, cp); s += n;
+    int gi = glyphIndex(cp, font);
+    int adv = charAdvance(cp, font, scale);
+    // 整字都在窗口外就跳过，别白跑 16x16 的位循环
+    if (gi >= 0 && ox <= x1 && ox + size * scale > x0) {
+      const uint8_t *g = tab + (size_t)gi * size * rowb;
+      int lo = (x0 - ox) / scale, hi = (x1 - ox) / scale;
+      if (lo < 0) lo = 0;
+      if (hi > size - 1) hi = size - 1;
+      for (int gy = 0; gy < size; gy++) {
+        for (int gx = lo; gx <= hi; gx++) {
+          if (g[gy * rowb + (gx >> 3)] & (0x80 >> (gx & 7))) {
+            if (scale == 1) setPixel(ox + gx, y + gy, color);
+            else fillRect(ox + gx * scale, y + gy * scale, scale, scale, color);
+          }
+        }
+      }
+    }
+    ox += adv;
+  }
+  return total;
+}
+
 int drawText(int x, int y, const char *s, uint16_t color, int font, int scale, int align) {
   int total = textWidth(s, font, scale);
   const int size = (font == 12) ? 12 : (font == 16) ? 16 : 24;

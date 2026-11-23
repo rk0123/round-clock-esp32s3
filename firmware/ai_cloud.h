@@ -353,33 +353,61 @@ struct TodoSnapshot {
   TodoItem items[TODO_MAX];
 };
 
+// v3.0.1：改成「一条一个键」存储。
+// 旧写法把整份清单塞进一个 3.2KB 的 blob，而 NVS 分区只有 20KB（0x5000），
+// blob 又要求一大段连续 entry —— 实测加到第 28 条就 `snapshot save failed`。
+// 更糟的是当时 todoCommit() 在失败后调 todoLoad()，等于用旧快照覆盖内存，
+// 用户刚加的待办会凭空消失（2026-11-20 就丢了 4 条）。
+// 现在每条独立成键（≤110 字节，只需 4~5 个连续 entry），碎片化也不会整份写不进去。
 static bool todoSave() {
-  TodoSnapshot snapshot = {};
-  snapshot.version = 1;
-  snapshot.count = gTodoN;
-  const size_t len = offsetof(TodoSnapshot, items) + gTodoN * sizeof(TodoItem);
-  memcpy(snapshot.items, gTodos, gTodoN * sizeof(TodoItem));
   Preferences prefs;
-  if (prefs.begin("rcfg", false) && prefs.putBytes("todo.v1", &snapshot, len) == len) return true;
-  Serial.println("[TODO] snapshot save failed");
-  return false;
+  if (!prefs.begin("rcfg", false)) { Serial.println("[TODO] nvs open failed"); return false; }
+  char key[12];
+  bool ok = true;
+  for (int i = 0; i < gTodoN; i++) {
+    snprintf(key, sizeof(key), "todo.%d", i);
+    String v = String((unsigned)gTodos[i].done) + "|" +
+               String((unsigned long)gTodos[i].deadline) + "|" + gTodos[i].text;
+    // 内容没变就不重写：每次编辑只动真正改到的那几条，少制造 NVS 擦写
+    if (prefs.getString(key, "\x01") == v) continue;
+    if (prefs.putString(key, v) == 0) { ok = false; break; }
+  }
+  if (ok) prefs.putInt("todo.n", gTodoN);
+  if (ok) {
+    // 清掉多余的旧条目键，别让上个版本的残留把条数撑大
+    for (int i = gTodoN; i < TODO_MAX; i++) {
+      snprintf(key, sizeof(key), "todo.%d", i);
+      if (prefs.isKey(key)) prefs.remove(key);
+    }
+    if (prefs.isKey("todo.v1")) prefs.remove("todo.v1");   // 迁移完就删掉旧大 blob
+  }
+  prefs.end();
+  if (!ok) Serial.printf("[TODO] save failed at #%d/%d\n", gTodoN, gTodoN);
+  return ok;
 }
 
 static void todoLoad() {
+  bool migrated = false;
   {
     Preferences prefs;
     if (prefs.begin("rcfg", true) && prefs.isKey("todo.v1")) {
-      TodoSnapshot snapshot = {};
-      const size_t len = prefs.getBytesLength("todo.v1");
-      if (len >= offsetof(TodoSnapshot, items) && len <= sizeof(snapshot) &&
-          prefs.getBytes("todo.v1", &snapshot, len) == len &&
-          snapshot.version == 1 && snapshot.count <= TODO_MAX &&
-          len == offsetof(TodoSnapshot, items) + snapshot.count * sizeof(TodoItem)) {
-        gTodoN = snapshot.count;
-        memcpy(gTodos, snapshot.items, gTodoN * sizeof(TodoItem));
-        for (int i = 0; i < gTodoN; ++i) gTodos[i].text[sizeof(gTodos[i].text) - 1] = 0;
-        return;
+      // 老版本留下来的一整份快照：读出来之后立刻按新格式重存一份
+      TodoSnapshot *snapshot = (TodoSnapshot *)ps_malloc(sizeof(TodoSnapshot));
+      if (snapshot) {
+        const size_t len = prefs.getBytesLength("todo.v1");
+        if (len >= offsetof(TodoSnapshot, items) && len <= sizeof(TodoSnapshot) &&
+            prefs.getBytes("todo.v1", snapshot, len) == len &&
+            snapshot->version == 1 && snapshot->count <= TODO_MAX &&
+            len == offsetof(TodoSnapshot, items) + snapshot->count * sizeof(TodoItem)) {
+          gTodoN = snapshot->count;
+          memcpy(gTodos, snapshot->items, gTodoN * sizeof(TodoItem));
+          for (int i = 0; i < gTodoN; ++i) gTodos[i].text[sizeof(gTodos[i].text) - 1] = 0;
+          migrated = true;
+        }
+        free(snapshot);
       }
+      prefs.end();
+      if (migrated) { todoSave(); return; }   // 重存成逐条键，顺便删掉 blob
     }
   }
   // 兼容旧索引和旧条目键。下一次修改时用一个快照提交。
@@ -408,8 +436,9 @@ static void todoLoad() {
 }
 static bool todoCommit() {
   if (todoSave()) return true;
-  todoLoad();
-  showToast("待办保存失败");
+  // 存盘失败时**绝不能** todoLoad() 回滚：那会用旧快照覆盖内存，用户刚勾的、刚加的
+  // 全部消失（2026-11-20 丢的 4 条待办就是这条路径）。保住内存状态，只提示。
+  showToast("待办未存盘");
   return false;
 }
 

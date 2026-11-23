@@ -147,6 +147,10 @@ static bool             gConnected  = false;
 enum AudioState : uint8_t { A_IDLE = 0, A_CONNECTING, A_PLAYING, A_PAUSED, A_ERROR };
 static volatile AudioState gAudioState = A_IDLE;
 static volatile int     gAudioVol   = 16;
+// v3.1：音量统一由 ES8311 硬件承载。小智语音走 i2s_channel_write 直写 PCM，
+// 完全绕过音频库的软件音量，所以「下拉菜单调音量，小智没反应」。
+// 这里记住已写入 DAC 的值，避免同一档位反复写 I2C。
+static volatile int     gHwVolume   = 70;
 static volatile int     gToneFreq   = 440;
 static volatile int     gToneMs     = 1500;
 
@@ -175,7 +179,8 @@ enum : uint8_t {
   AQ_NONE = 0, AQ_PLAY, AQ_TOGGLE, AQ_NEXT, AQ_STOP, AQ_TONE, AQ_VOL,
   AQ_SOURCE, AQ_SELECT, AQ_RESCAN_TF, AQ_PODFEED, AQ_PODADD, AQ_PODCLEAR, AQ_TFTEST,
   AQ_PLAYFILE,           // 播一条指定路径的本地音频（录音回放用，text = 完整路径）
-  AQ_PLAYURL             // 播一条网络音频（背单词发音：有道 dictvoice，text = 完整 URL）
+  AQ_PLAYURL,            // 播一条网络音频（背单词发音：有道 dictvoice，text = 完整 URL）
+  AQ_SEEK                // 按秒跳转（arg = 目标秒数；仅本地文件有效）
 };
 struct AudCmd {
   uint8_t cmd; int arg; int arg2;
@@ -822,11 +827,38 @@ static void audExec(const AudCmd &c) {
     case AQ_NEXT:    gAudRetry = 0; audNext(c.arg); break;
     case AQ_STOP:    audStop(); break;
     case AQ_TONE:    gToneFreq = c.arg; gToneMs = c.arg2; doTone(gToneFreq, gToneMs); break;
-    case AQ_VOL:
+    case AQ_VOL: {
       gAudioVol = c.arg;
       gVolDirty = true;                 // 由主循环统一同步，暂停态下仍保持静音
-      Serial.printf("[AUD] volume -> %d/21\n", (int)gAudioVol);
+      // 库的 setVolume 只作用于它自己解码出来的数据；小智的 PCM 是直写 I2S 的，
+      // 唯一能同时管住两条通路的点就是 ES8311 的 DAC 音量。0..21 线性映射到 0..100。
+      const int hw = constrain((int)gAudioVol * 100 / 21, 0, 100);
+      if (gCodec && hw != gHwVolume) {
+        if (es8311_voice_volume_set(gCodec, hw, nullptr) == ESP_OK) gHwVolume = hw;
+      }
+      Serial.printf("[AUD] volume -> %d/21 (dac %d/100)\n", (int)gAudioVol, hw);
       break;
+    }
+    case AQ_SEEK: {
+      // v3.1：拖动外圈进度条跳转。库的 setFilePos() 吃的是**文件字节偏移**，
+      // 不是秒，只能按「时长比例」换算（CBR 精确，VBR 会有偏差，够用）。
+      // 库里这个接口对网络流是硬挡的（m_dataMode 必须是 AUDIO_LOCALFILE），
+      // 所以电台/播客会被拒 —— 调用方先用 audioCanSeek() 判断，别让用户白拖。
+      if (!gAudioReady || gAudioState == A_IDLE || gAudioState == A_CONNECTING) break;
+      const uint32_t dur = gAudDuration;
+      if (dur < 2) { Serial.println("[AUD] seek: duration unknown"); break; }
+      uint32_t s = (c.arg < 0) ? 0 : (uint32_t)c.arg;
+      if (s > dur - 1) s = dur - 1;
+      const uint32_t size = gAudio->getFileSize();
+      if (!size) { Serial.println("[AUD] seek: file size unknown"); break; }
+      const uint32_t pos = (uint32_t)((uint64_t)size * s / dur);
+      const bool ok = gAudio->setFilePos(pos);
+      if (ok) gAudElapsed = s;
+      Serial.printf("[AUD] seek -> %us/%us (%u/%u bytes) %s\n",
+                    (unsigned)s, (unsigned)dur, (unsigned)pos, (unsigned)size,
+                    ok ? "OK" : "REJECTED");
+      break;
+    }
     case AQ_SOURCE: {
       AudSrc ns = (AudSrc)constrain(c.arg, 0, (int)AS_COUNT - 1);
       bool wasPlaying = (gAudioState == A_PLAYING || gAudioState == A_CONNECTING);
@@ -925,7 +957,9 @@ static void audioTask(void *) {
   gAudio = new Audio();
   if (gAudio) {
     gAudio->setPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN, I2S_MCLK_PIN);
-    gAudio->setVolume(16);
+    // v3.1：库音量固定拉满，响度全部交给 ES8311 硬件音量（见 AQ_VOL）。
+    // 两边都调会变成双重衰减：同一个 16/21 档位听起来比原来轻一大截。
+    gAudio->setVolume(21);
     // setConnectionTimeout 同时作用于 WiFiClientSecure 的 connect **和 read**。
     // 旧值 (3000,2000) 让直播流一次 chunk 间隔 >2s 就被误判断连。
     gAudio->setConnectionTimeout(8000, 8000);
@@ -956,7 +990,7 @@ static void audioTask(void *) {
     bool wantMute = (gAudioState == A_PAUSED || gAudioState == A_IDLE || gAudioState == A_ERROR) &&
                     !gExtPcmOn.load();
     if (gAudioReady && (wantMute != gMuteApplied || gVolDirty)) {
-      gAudio->setVolume(wantMute ? 0 : (uint8_t)gAudioVol);
+      gAudio->setVolume(wantMute ? 0 : 21);   // 满值；响度由 DAC 音量决定
       gMuteApplied = wantMute;
       gVolDirty = false;
     }
@@ -978,6 +1012,13 @@ static void audioToggle()                 { audSend(AQ_TOGGLE); }
 static void audioStop()                   { audSend(AQ_STOP); }
 static void audioToneRequest(int f, int ms) { audSend(AQ_TONE, f, ms); }
 static void audioVolume(int v)            { audSend(AQ_VOL, constrain(v, 0, 21)); }
+// v3.1：外圈进度环拖动。只有本地文件能真正跳（库限制，见 AQ_SEEK 注释）；
+// 电台是直播流没有时长，播客是网络流，两者都给 false，UI 据此不响应拖动。
+static bool audioCanSeek() {
+  return gAudioReady && gAudioState != A_IDLE && gAudioState != A_CONNECTING &&
+         gAudDuration > 1 && gSrc != AS_POD;
+}
+static void audioSeekSeconds(uint32_t sec) { audSend(AQ_SEEK, (int)sec); }
 static void audioSetSource(int s)         { audSend(AQ_SOURCE, s); }
 static void audioRescanTF()               { audSend(AQ_RESCAN_TF); }
 static void audioTfTest()                 { audSend(AQ_TFTEST); }
@@ -1095,6 +1136,7 @@ static bool audioInit() {
   esp_err_t e = es8311_init(gCodec, &clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16);
   if (e != ESP_OK) { Serial.printf("[AUD] ES8311 init failed %d\n", (int)e); return false; }
   es8311_voice_volume_set(gCodec, 70, nullptr);
+  gHwVolume = 70;                     // 与上面一致；之后由 AQ_VOL 接管
   es8311_microphone_config(gCodec, false);
   es8311_voice_mute(gCodec, false);
 

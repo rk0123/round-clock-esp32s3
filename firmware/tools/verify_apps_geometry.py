@@ -90,20 +90,20 @@ checks.append(("TODO add btn r30", outer(108, 285, 30), SAFE))
 checks.append(("TODO next btn r30", outer(180, 285, 30), SAFE))
 checks.append(("TODO clear btn r30", outer(252, 285, 30), SAFE))
 
-# ---- 宠物页（整屏彩色像素游戏画面，无外壳）：屏 + 状态条 + 太阳 + 底部四键 ----
+# ---- WorkBuddy 伙伴页：七态 ASCII 精灵 + 授权面板 + 底部三键 ----
 # 整屏背景 (180,180) r172：与所有页面一致，按 PANEL 口径（不按文字安全区）
 checks.append(("PET screen r172", outer(180, 180, 172), PANEL))
-# 顶部 4 条状态：第 1 条 x=70 / 第 4 条条尾 x=295，y=96..103
-checks.append(("PET bar 1 left", box_corner(70, 96, 62, 7), SAFE))
-checks.append(("PET bar 4 right", box_corner(244, 96, 51, 7), SAFE))
-# 太阳 (288,132) r12 + 右光芒到 x=308
-checks.append(("PET sun r12", outer(288, 132, 12), SAFE))
-checks.append(("PET sun ray right", outer(308, 132, 2), SAFE))
-# 宠物最大 96x72 居中 (180,200) -> 左 132 / 右 228 / 下 238
-checks.append(("PET body right", box_corner(132, 166, 96, 72), SAFE))
-# 底部四键最外侧 (120,286)/(264,286) r20
-checks.append(("PET btn left r20", outer(120, 286, 20), SAFE))
-checks.append(("PET btn right r20", outer(264, 286, 20), SAFE))
+# 标题 "桌面伙伴" FONT24 = 96px，y=30..54（uiPage 统一位置）
+checks.append(("PET title cn", box_corner(132, 30, 96, 24), SAFE))
+# 状态行：最长 "实时  待授权  会话十" = 12 汉字 × 16px，y=66..82
+checks.append(("PET status row cn", box_corner(84, 66, 192, 16), SAFE))
+# 精灵：5 行 × FONT12×2 = 192×120，xOff 最大 ±6px，yOff 最小 -4
+checks.append(("PET art frame", box_corner(78, 84, 192, 124), SAFE))
+# 信息 / 授权面板 48,212 264×40
+checks.append(("PET info panel", box_corner(48, 212, 264, 40), SAFE))
+# 底部三键，统一网格 y=285 r30
+for cx in (108, 180, 252):
+    checks.append((f"PET btn {cx} r30", outer(cx, 285, 30), SAFE))
 
 # ---- 单词页：词书键 4x2 r28 / 底部键 (180,310) r22 / 顶部「当前 xx」胶囊 ----
 for cx in (103, 160, 217, 274):

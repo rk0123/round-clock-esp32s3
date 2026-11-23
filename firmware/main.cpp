@@ -49,7 +49,8 @@ extern uint8_t Touch_interrupts;
 #define C_VINYL     COL(13, 17, 24)
 
 #include "ui_kit.h"       // 二期统一 UI 组件（页面底 / 圆键 / 胶囊键 / 蛋形）
-#include "pet.h"          // v2.0 拓麻歌子整机（依赖上面的颜色宏 + ui_kit）
+#include "pet.h"          // WorkBuddy Buddy 七态桌面伙伴（旧拓麻歌子见 pet_v29_sealed.h）
+#include "buddy_cloud.h"  // 云端推送源：WiFi 轮询 /api/state + 回传 OK/NO
 #include "words.h"        // v1.0 百词斩式背单词（内含 wordbank.h）
 #include "mic_recorder.h" // v1.0 ES7210 双麦录音（官方驱动）
 #include "ai_cloud.h"     // v1.0 百炼 ASR / Qwen / Todo / 凭据
@@ -155,6 +156,7 @@ struct BatteryState {
   uint32_t lastMs = 0;
 };
 static BatteryState gBat;
+static int gBatFail = 0;      // 连续读取失败次数（v3.0 去抖，3 次才判无效）
 // 验收注入：串口 BATF <soc> [chg] 可强制电量显示（-1 = 用真实读数），
 // 只为在没有真实低电/充电工况时验证颜色与格数，不写 NVS、不影响电量计本身。
 static int gBatFakeSoc = -1, gBatFakeChg = -1;
@@ -178,7 +180,14 @@ static void batteryPoll(bool force = false) {
   if (!force && millis() - gBat.lastMs < 3000) return;
   gBat.lastMs = millis();
   uint16_t soc = 0, mv = 0, ma = 0, st = 0, rm = 0, fcc = 0;
-  if (!bqRead16(0x2C, soc)) { gBat.valid = false; return; }   // NAK = 没焊芯片 / 没电池
+  // v3.0：单次 I²C NAK 不再直接判"没电池"。共享 I²C 上有触摸 / RTC / ES8311，
+  // 网络忙（TLS 抢内部 RAM、Wire 超时）时偶发失败很常见，一失败屏上电量就会
+  // 从 4 格变成 4 条浅灰短横。现在连续失败 3 次（约 9s）才认定读数无效。
+  if (!bqRead16(0x2C, soc)) {
+    if (++gBatFail >= 3) gBat.valid = false;
+    return;
+  }
+  gBatFail = 0;
   bqRead16(0x08, mv); bqRead16(0x0C, ma); bqRead16(0x0A, st);
   bqRead16(0x10, rm); bqRead16(0x12, fcc);
   // 电压不在单节锂电范围就认为电池没插，绝不显示编造的百分比
@@ -258,8 +267,41 @@ static int  gNetEnc[16];
 #define ST_BTN_MINUS_CX 238
 #define ST_BTN_PLUS_CX  290
 #define ST_BTN_R   15
+// v3.1：一键静音。夹在两颗 +/- 圆心正中（238 与 290 的中间），r11，
+// 两侧各留 15px 空隙不会互相压到；触摸判定放到 17 是为了手指好按。
+#define ST_BTN_MUTE_CX 264
+#define ST_BTN_MUTE_R  11
 #define ST_BAR_X   58
 #define ST_BAR_W   150
+
+// ---------------------------------------------------------------- 外圈进度环拖动（v3.1）
+// 环画在 r=170（0° 起顺时针 300°，缺口留在 3 点钟方向）。
+// 触摸是 100Hz 采样的，如果走事件队列（只在抬手时发一条）就跟不上手指，
+// 所以拖动状态直接由 touchTask 写、渲染线程读，只在抬手时才交一次 seek。
+static volatile bool gRingArmed    = false;   // 当前页允许拖环（音乐页且在放可跳的曲目）
+static volatile bool gRingDragging = false;
+static volatile int  gRingDragPm   = -1;      // 0..1000 千分比，-1 = 没在拖
+static volatile int  gRingSeekTo   = -1;      // 抬手后待执行的千分比
+
+#define RING_R     170.0f
+#define RING_HIT0  148.0f                     // 环带内半径
+#define RING_HIT1  190.0f                     // 环带外半径（手指按不精确，留宽一点）
+#define RING_SPAN  300.0f                     // 环的有效角度
+
+static bool ringHit(int x, int y) {
+  const float dx = x - 180.0f, dy = y - 180.0f;
+  const float r = sqrtf(dx * dx + dy * dy);
+  return r >= RING_HIT0 && r <= RING_HIT1;
+}
+// 屏幕坐标 -> 千分比。x 向右、y 向下，atan2(dy,dx) 天然就是"顺时针为正"，
+// 正好对上 arcRing 的角度方向（0° 在 3 点钟，顺时针递增）。
+static int ringPermille(int x, int y) {
+  float a = atan2f((float)y - 180.0f, (float)x - 180.0f) * 57.29578f;
+  if (a < 0) a += 360.0f;
+  if (a >= RING_SPAN) return -1;            // 缺口段：不认，避免手指搭在缝上乱跳
+  int pm = (int)(a * 1000.0f / RING_SPAN);
+  return pm < 0 ? 0 : (pm > 1000 ? 1000 : pm);
+}
 
 // ---------------------------------------------------------------- 导航模型（v2.0 起）
 // 除主界面（表盘）外，**所有入口都收进应用中心**，页面之间不再是十字/环形。
@@ -1094,6 +1136,8 @@ static void netPollConnection() {
 static void netTask(void *) {
   bool preferWeather = false;
   for (;;) {
+    // Buddy 云端推送源：5s 轮询，内部自己限速；TLS 与决策回传都在这里做
+    wbCloudPoll();
     if (!cloudPollJobs() && wifiOK.load() && !netBusy.load()) {
       const uint32_t now = millis();
       const uint32_t wxAt = lastWx.load(), adsbAt = lastAdsb.load();
@@ -1440,16 +1484,23 @@ static void drawBatteryBlocks(int x, int y) {
   bool low  = (soc0 >= 0 && !chg && soc <= 15);
 
   uint16_t on  = low ? COL(220, 60, 48) : COL(66, 178, 108);
-  uint16_t off = COL(210, 205, 192);          // 未点亮：比纸色深一档，像"空槽"
+  uint16_t off = COL(178, 170, 150);          // 未点亮：中性暖灰，明确比纸色深（旧值 210,205,192 太浅像白线）
 
   int lit = (soc0 < 0) ? 0 : (soc * N + 50) / 100;
   if (soc0 >= 0 && soc > 0 && lit < 1) lit = 1;
 
+  // v3.0 修正（用户反馈「网络慢时屏幕左边出现多条短白横线」）：
+  //   ① 电量计偶发 I²C NAK 时 valid 立刻翻 false，这里 4 格全画成浅灰 (210,205,192)，
+  //      在纸色底上就是 4 条悬空的浅色短横 —— 正是用户看到的东西。
+  //      现在读不到电量（soc0 < 0）**一格都不画**，宁可没有，也不留 4 条假横线。
+  //   ② 空格颜色从浅灰改成比纸色略深的暖灰槽，并加 1px 描边，读起来是"空槽"不是"白线"。
+  if (soc0 < 0) return;
+
   // 充电流水：700ms 一格（用户："速度慢一点"，400 → 700）→ 2.8s 一圈。
   // 表盘 4fps 刷新，每格大约停在屏上 2~3 帧，光点是"上爬"而不是"闪"。
   const uint16_t c_hot = COL(240, 168, 40);   // 当前跑动的光点
-  const uint16_t c_dim = COL(250, 214, 168);  // 已达电量的格（淡琥珀底）
-  const uint16_t c_off = COL(226, 220, 204);  // 未达电量的空槽（淡灰）
+  const uint16_t c_dim = COL(226, 182, 104);  // 已达电量的格（淡琥珀底；原来 250,214,168 在纸色底上发白）
+  const uint16_t c_off = COL(190, 183, 164);  // 未达电量的空槽（暖灰，不是"白条"）
   int phase = (int)((millis() / 700) % N);    // 0 = 最下面那格
 
   for (int i = 0; i < N; i++) {                // i=0 是最上面那格
@@ -1575,8 +1626,16 @@ static void renderMusic() {
   uint32_t dur = audioDuration();
   float prog = dur ? (float)audioElapsed() / (float)dur : trackProgress;
   if (prog > 1) prog = 1;
+  // v3.1：拖动中进度跟手指走，抬手才真正 seek（gRingSeekTo 由 loop 消费）
+  const int dragPm = gRingDragPm;
+  if (dragPm >= 0) prog = dragPm / 1000.0f;
   circle(180, 180, 170, COL(44, 53, 72));
-  arcRing(180, 180, 170, 0, (int)(300.0f * prog), 3, C_ORANGE);
+  arcRing(180, 180, 170, 0, (int)(RING_SPAN * prog), dragPm >= 0 ? 5 : 3,
+          dragPm >= 0 ? C_YELLOW : C_ORANGE);
+  if (dragPm >= 0) {                      // 环末端加一颗把手，明确"现在是拖着的"
+    const float ra = (float)dragPm * RING_SPAN / 1000.0f * 0.01745329f;
+    fillCircle(180 + (int)(RING_R * cosf(ra)), 180 + (int)(RING_R * sinf(ra)), 7, C_WHITE);
+  }
 
   // ── v0.27 控制区全圆化 ──────────────────────────────────────────
   // 圆屏里塞一排圆角矩形，边角会自己跟弧线打架。五个功能键全部改**圆形**，
@@ -1606,7 +1665,12 @@ static void renderMusic() {
   // v0.27：曲名从 y=76 下移到 86 —— 左右两颗音源圆（r=23，底边 y=79）会压过来
   fitText(nm, sizeof(nm), audioCurrentName(), 16, 250);
   drawText(180, 90, nm, C_WHITE, 16, 1, 1);
-  if (dur) snprintf(sub, sizeof(sub), "%s %d/%d %02u:%02u/%02u:%02u", st,
+  if (dragPm >= 0 && dur) {
+    const uint32_t ss = (uint32_t)((uint64_t)dur * dragPm / 1000);
+    snprintf(sub, sizeof(sub), "SEEK %02u:%02u / %02u:%02u",
+             (unsigned)(ss / 60), (unsigned)(ss % 60),
+             (unsigned)(dur / 60), (unsigned)(dur % 60));
+  } else if (dur) snprintf(sub, sizeof(sub), "%s %d/%d %02u:%02u/%02u:%02u", st,
                     audioIndex() + 1, n, (unsigned)(audioElapsed() / 60), (unsigned)(audioElapsed() % 60),
                     (unsigned)(dur / 60), (unsigned)(dur % 60));
   else     snprintf(sub, sizeof(sub), "%s %s %d/%d", st, AUD_SRC_NAME[src], audioIndex() + 1, n);
@@ -2152,11 +2216,11 @@ static void renderWifi() {
         String bkPass;
         bool   known = wifiBookFind(String(gNetSSID[idx]), bkPass);   // 密码簿里有记录
         char disp[34];
-        fitText(disp, sizeof(disp), gNetSSID[idx], 16, known ? 314 - 104 - 26 : 314 - 104 - 12);
+        fitText(disp, sizeof(disp), gNetSSID[idx], 16, known ? 314 - 104 - 32 : 314 - 104 - 12);
         drawBtnText(104, ry, rowH - 4, disp, C_WHITE, 16, 1, 0);
-        if (known) {                                   // 已记住密码：行尾打绿勾
-          line(299, ry + 15, 304, ry + 20, C_GREEN, 2);
-          line(304, ry + 20, 311, ry + 9,  C_GREEN, 2);
+        if (known) {
+          // 已记住密码：点行主体直接连，点这里的「改」才进键盘改密码
+          drawBtnText(300, ry, rowH - 4, "改", COL(126, 200, 240), 16, 1, 1);
         }
       }
       if (maxScroll > 0)
@@ -2205,7 +2269,28 @@ static void wifiConnect() {
 // 一行一个设置项：Wi-Fi（进入配网页）/ 亮度 / 音量。后续新设置继续往这里加行即可。
 // v0.15 起设置齿轮已移除：任意页面下拉即可呼出设置，表盘不再放图标。
 
-static void drawSliderRow(int rowY, const char *label, int val, int vmax, const char *valTxt) {
+static void drawMuteBtn(int rowY) {
+  const int cy = rowY + 17;
+  const bool muted = (gVolume <= 0);
+  fillCircle(ST_BTN_MUTE_CX, cy, ST_BTN_MUTE_R, muted ? COL(122, 54, 46) : C_SLATE);
+  const uint16_t c = muted ? COL(255, 156, 132) : C_WHITE;
+  // 喇叭：左边方块 + 向右张开的三角（点阵逐列填充）
+  fillRect(ST_BTN_MUTE_CX - 6, cy - 2, 4, 5, c);
+  for (int i = 0; i < 6; i++)
+    fillRect(ST_BTN_MUTE_CX - 2 + i, cy - 2 - i, 1, 5 + 2 * i, c);
+  if (muted) {
+    // 静音：一条 45° 斜杠压过去（点阵没有 ✕ 字形，自己画）
+    for (int i = -5; i <= 5; i++)
+      fillRect(ST_BTN_MUTE_CX + i, cy + i, 2, 2, COL(255, 122, 100));
+  } else {
+    // 有声：两道短线当声波
+    fillRect(ST_BTN_MUTE_CX + 5, cy - 3, 1, 7, c);
+    fillRect(ST_BTN_MUTE_CX + 7, cy - 5, 1, 11, c);
+  }
+}
+
+static void drawSliderRow(int rowY, const char *label, int val, int vmax, const char *valTxt,
+                          bool muteBtn = false) {
   fillRoundRect(ST_RX, rowY, ST_RW, ST_RH, 10, COL(28, 36, 44));
   drawText(ST_BAR_X, rowY + 9, label, COL(150, 162, 182), 12, 1, 0);
   // 数值（右对齐到进度条末端）
@@ -2222,6 +2307,7 @@ static void drawSliderRow(int rowY, const char *label, int val, int vmax, const 
   fillCircle(ST_BTN_PLUS_CX, cy, ST_BTN_R, C_SLATE);
   fillRect(ST_BTN_PLUS_CX - 6, cy - 1, 12, 3, C_WHITE);
   fillRect(ST_BTN_PLUS_CX - 1, cy - 6, 3, 12, C_WHITE);
+  if (muteBtn) drawMuteBtn(rowY);
 }
 
 static void renderSettings() {
@@ -2246,7 +2332,7 @@ static void renderSettings() {
 
   // ── 第 3 行：音量
   char v[10]; snprintf(v, sizeof(v), "%d/%d", gVolume, VOL_MAX);
-  drawSliderRow(ST_R3, "VOLUME", gVolume, VOL_MAX, v);
+  drawSliderRow(ST_R3, "VOLUME", gVolume, VOL_MAX, v, true);
 
   // ── 第 4 行：左 FACE 主界面表盘（模拟 / 数字）/ 右 LANG 数字表盘语言
   fillRoundRect(ST_FACE_X, ST_R4, ST_HALF_W, ST_RH, 10, COL(28, 36, 44));
@@ -2354,6 +2440,22 @@ static void volumeStep(int d) {
   Serial.printf("[UI] volume -> %d/21\n", gVolume);
 }
 
+// v3.1：一键静音。记住静音前的档位，再按一次还原（没记到就回到 12/21，别让人卡在无声里）。
+static int gVolBeforeMute = 0;
+static void volumeToggleMute() {
+  if (gVolume > 0) {
+    gVolBeforeMute = gVolume;
+    gVolume = 0;
+  } else {
+    gVolume = (gVolBeforeMute > 0) ? gVolBeforeMute : 12;
+    gVolBeforeMute = 0;
+  }
+  audioVolume(gVolume);
+  cfgSetInt("vol", gVolume);
+  showToast(gVolume ? "声音已恢复" : "已静音");
+  Serial.printf("[UI] %s volume=%d/%d\n", gVolume ? "unmute" : "MUTE", gVolume, VOL_MAX);
+}
+
 // 小智绑定子页开关：设置页第 6 行和小智页都要用，定义必须在 settingsTap 之前。
 static bool gXzPageOpen = false;
 
@@ -2390,6 +2492,7 @@ static bool settingsTap(int x, int y) {
   if (y >= ST_R3 && y <= ST_R3 + ST_RH) {
     if (hit(x, y, ST_BTN_MINUS_CX, ST_R3 + 21, ST_BTN_R + 6))      volumeStep(-3);
     else if (hit(x, y, ST_BTN_PLUS_CX, ST_R3 + 21, ST_BTN_R + 6))  volumeStep(+3);
+    else if (hit(x, y, ST_BTN_MUTE_CX, ST_R3 + 17, ST_BTN_MUTE_R + 6)) volumeToggleMute();
     render(); return true;
   }
   if (y >= ST_R4 && y <= ST_R4 + ST_RH) {
@@ -3081,8 +3184,40 @@ static bool recListTap(int x, int y) {
 
 // ---------------- 待办清单：清单是唯一数据源，勾选 / 删除 / 翻页 / 清空 / 语音加 ----------------
 #define TODO_PER_PAGE 5
+
+// 条目正文最长 96 字节（≈32 个汉字 = 512px），而列表一行只有 130px 可视宽。
+// 原来用 fitText 截成「..」，后半句永远看不到 → 改成超出即横向走马灯：
+//   · 装得下 → 原地画（短条目不动，避免整页一起晃）
+//   · 装不下 → 起点停 1s，再以 25px/s 走完一圈，尾部留 28px 空隙自动循环
+// 相位取 millis()，各条目周期随自身长度不同，不会同步滑动像整体抖动。
+#define TODO_TXT_X0   74          // 勾选框右侧 → 期限标签左侧之间的可视区
+#define TODO_TXT_X1  204
+#define TODO_MQ_HOLD  1000UL      // 起点停留
+#define TODO_MQ_SPEED 40UL        // 每像素毫秒（40ms/px = 25px/s）
+static bool gTodoScrolling = false;   // 本页存在超宽条目 → loop() 提高该页刷新率
+
+static void todoDrawMarquee(int y, const char *s, uint16_t col, int x0, int x1, bool centered) {
+  int w = textWidth(s, 16, 1);
+  int avail = x1 - x0 + 1;
+  if (w <= avail) {
+    if (centered) drawText((x0 + x1 + 1) / 2, y, s, col, 16, 1, 1);
+    else          drawText(x0, y, s, col, 16, 1, 0);
+    return;
+  }
+  gTodoScrolling = true;
+  const int gap = 28;
+  int span = w + gap;
+  uint32_t moveMs = (uint32_t)span * TODO_MQ_SPEED;
+  uint32_t t = millis() % (moveMs + TODO_MQ_HOLD);
+  int off = (t < TODO_MQ_HOLD) ? 0 : (int)((t - TODO_MQ_HOLD) / TODO_MQ_SPEED);
+  // 画两遍：第一遍逐渐移出左边，第二遍紧跟着从右边补进来，中间不留空窗
+  drawTextClip(x0 - off, y, s, col, 16, 1, x0, x1);
+  drawTextClip(x0 - off + span, y, s, col, 16, 1, x0, x1);
+}
+
 static void renderTodo() {
   uiPage("待办清单", COL(90, 150, 110));
+  gTodoScrolling = false;
   int pages = (gTodoN + TODO_PER_PAGE - 1) / TODO_PER_PAGE;
   if (pages < 1) pages = 1;
   if (gTodoPage >= pages) gTodoPage = pages - 1;
@@ -3118,9 +3253,7 @@ static void renderTodo() {
         line(52, ry + 9, 57, ry + 14, C_GREEN, 2);
         line(57, ry + 14, 63, ry + 4, C_GREEN, 2);
       }
-      char txt[28];
-      fitText(txt, sizeof(txt), gTodos[i].text, 16, 128);
-      drawText(74, ry + 1, txt, col, 16, 1, 0);
+      todoDrawMarquee(ry + 1, gTodos[i].text, col, TODO_TXT_X0, TODO_TXT_X1, false);
       // 期限短标签：今天/明天/N天后/逾期N天；点它可改期限
       char dlLab[20]; uint16_t dlCol = C_GREY;
       todoDeadlineLabel(gTodos[i].deadline, dlLab, sizeof(dlLab), dlCol);
@@ -3153,10 +3286,10 @@ static bool todoSetQuickDeadline(int days) {
 }
 static void renderTodoDeadline() {
   uiPage("设置期限", COL(90, 150, 110));
+  gTodoScrolling = false;
   if (gTodoDeadlineFor < 0 || gTodoDeadlineFor >= gTodoN) return;
-  char preview[28];
-  fitText(preview, sizeof(preview), gTodos[gTodoDeadlineFor].text, 16, 232);
-  drawText(180, 76, preview, C_WHITE, 16, 1, 1);
+  // 同一套走马灯：y=76 处圆内可用半宽 √(158²-104²)=119 → [61,299]，取 [68,292] 留边
+  todoDrawMarquee(76, gTodos[gTodoDeadlineFor].text, C_WHITE, 68, 292, true);
   char cur[20]; uint16_t cc = C_GREY;
   todoDeadlineLabel(gTodos[gTodoDeadlineFor].deadline, cur, sizeof(cur), cc);
   drawText(112, 104, "当前", cc, 16, 1, 0);
@@ -3175,7 +3308,12 @@ static void renderTodoDeadline() {
 }
 
 // ================================================================ 渲染调度
+// SHOT 抓帧期间冻结渲染：dump 分 8KB 块 + yield，loop() 会在块之间继续跑 render()，
+// 而 flushScreen() 是**原地 bswap** FB —— 帧一变，前半段是旧帧、后半段是新帧，
+// 颜色还会因为"少做/多做一次字节交换"整块泛粉（截图看起来像表盘被切成两半）。
+static volatile bool gShotBusy = false;
 static void render() {
+  if (gShotBusy) return;         // 抓帧中不重绘，保证整幅 FB 属于同一帧
   if (gLocked) return;           // 息屏中：不画任何东西（背光已关，画了也看不见，白耗 CPU）
   // v2.8：进入背单词页自动读一遍当前词（开关开时）。只在页面切换那一帧触发，
   // 之后 250ms 的常规重绘不会再发音。
@@ -3212,6 +3350,8 @@ static void render() {
 // PAGE <0..4> 强制切页；SHOT 把 360x360 RGB565 帧缓冲原样回传，PC 端可转 PNG 验收
 bool cfgExtra(const String &raw) {
   String up = raw; up.toUpperCase();
+  // WorkBuddy 桥接器下发的逐行 JSON 快照（心跳 / turn / cmd），交给宠物状态机
+  if (raw.startsWith("{")) { petFeedJson(raw.c_str()); return true; }
   if (up == "WBOOK") {                 // 查看已记住密码的网络（只报长度，不报明文）
     wifiBookLoad();
     wifiBookDump();
@@ -3270,20 +3410,27 @@ bool cfgExtra(const String &raw) {
     // 抓帧期间暂停网络任务：netTask 的 [WX]/[ADSB] 日志会插进二进制流，
     // PC 端解码就会整体错位（看着像"表盘被切成两半"）。
     netBusy = true;
+    gShotBusy = true;           // 同时冻结渲染：块间 yield 时不能重绘 FB
     delay(60);                  // 让已经在跑的 HTTP 打印收尾
     Serial.print("===FB_BEGIN===\n");
     // 一次写 259200B 会长时间占住 loop()（Core1），并发 TLS 时容易触发
     // Task WDT 复位。改成 8KB 分块 + yield，让 idle task 能喂狗。
+    // v3.0：每块前面加一行块头 "B<idx>"。音频库是直接 Serial.print 的，SHOT 期间
+    // 仍可能插一行日志进来 —— 有了块头，PC 端能重新对齐（插在块之间的日志直接跳过），
+    // 不会再把整幅图错位成"粉色下半屏"。
     const uint8_t *p = (const uint8_t *)FB;
     size_t left = (size_t)SCREEN_W * SCREEN_H * 2;
+    uint32_t idx = 0;
     while (left) {
       size_t chunk = (left > 8192) ? 8192 : left;
+      Serial.printf("B%lu\n", (unsigned long)idx);
       Serial.write(p, chunk);
       Serial.flush();
       yield();
-      p += chunk; left -= chunk;
+      p += chunk; left -= chunk; idx++;
     }
     Serial.print("\n===FB_END===\n");
+    gShotBusy = false;            // 抓完恢复渲染
     netBusy = false;              // 抓完立刻放开网络任务
     return true;
   }
@@ -3343,6 +3490,32 @@ bool cfgExtra(const String &raw) {
   // 注入一次真实滑动手势（进触摸队列，走和手指完全相同的手势判定），
   // 用来无手指验收「任意页面下拉呼出设置」「设置页上推返回」。
   // 用法：SWIPE <x1> <y1> <x2> <y2>
+  // v3.1：进度环拖动没法用 SWIPE 验（那是手势路径），所以要一个直连 seek 的调试口。
+  // 用法：SEEK <秒>  —— 只走 AQ_SEEK，能验出"库到底接不接受这次跳转"
+  if (up == "SEEK" || up.startsWith("SEEK ")) {
+    const int sec = (up == "SEEK") ? (int)(audioElapsed() / 2)
+                                   : raw.substring(5).toInt();
+    Serial.printf("[CFG] seek request %ds (canSeek=%d dur=%us)\n",
+                  sec, (int)audioCanSeek(), (unsigned)audioDuration());
+    audioSeekSeconds((uint32_t)(sec < 0 ? 0 : sec));
+    return true;
+  }
+  // v3.1：拖动链路的两个调试口。触摸判定（落点是否在环带上）没法用串口模拟，
+  // 但"拖动中长什么样 / 抬手后跳到哪"可以这样验：
+  //   RINGDRAG <0..1000>  进入拖动并把把手放在该位置
+  //   RINGDROP <0..1000>  抬手并真正 seek
+  if (up.startsWith("RINGDRAG ")) {
+    gRingDragPm = constrain(raw.substring(9).toInt(), 0, 1000);
+    Serial.printf("[CFG] ring drag %d/1000\n", (int)gRingDragPm);
+    render();
+    return true;
+  }
+  if (up.startsWith("RINGDROP ")) {
+    gRingDragPm = -1;
+    gRingSeekTo = constrain(raw.substring(9).toInt(), 0, 1000);
+    Serial.printf("[CFG] ring drop %d/1000\n", (int)gRingSeekTo);
+    return true;
+  }
   if (up.startsWith("SWIPE ")) {
     String rest = raw.substring(6); rest.trim();
     int a = rest.indexOf(' '), b = a < 0 ? -1 : rest.indexOf(' ', a + 1);
@@ -3428,7 +3601,30 @@ bool cfgExtra(const String &raw) {
     Serial.printf("[CFG] select track %d\n", i + 1);
     return true;
   }
-  if (up == "PET" || up.startsWith("PETSET ")) { petCmd(raw); return true; }
+  // WorkBuddy Buddy：PET / PETDEMO / PETSTATE n / PETNEXT / PETAPPROVE / PETDENY
+  //                / PETDIZZY / PETHEART / PETJSON <json>
+  if (up == "PET" || up == "PETDEMO" || up.startsWith("PETSTATE ") ||
+      up == "PETNEXT" || up == "PETAPPROVE" || up == "PETDENY" ||
+      up == "PETDIZZY" || up == "PETHEART" || up.startsWith("PETJSON ")) {
+    petCmd(raw); return true;
+  }
+  // 云端推送源：WBCLOUD <url> <token> / WBCLOUDOFF / WBCLOUDSTAT / WBCLOUDNOW
+  if (up.startsWith("WBCLOUD ")) {
+    String rest = raw.substring(8);
+    rest.trim();
+    int sp = rest.indexOf(' ');
+    if (sp < 0) { Serial.println("[WBC] usage: WBCLOUD <url> <token>"); return true; }
+    wbCloudSet(rest.substring(0, sp), rest.substring(sp + 1));
+    wbCloudPoll(true); render(); return true;
+  }
+  if (up == "WBCLOUDOFF") { wbCloudOff(); render(); return true; }
+  if (up == "WBCLOUDSTAT") {
+    Serial.printf("[WBC] enabled=%d url=%s token_len=%d polls=%u fails=%u pending=%d\n",
+                  wbCloudEnabled() ? 1 : 0, wbCloudUrl.c_str(), wbCloudToken.length(),
+                  wbCloudPolls, wbCloudFails, wbCloudDecisionPending ? 1 : 0);
+    return true;
+  }
+  if (up == "WBCLOUDNOW") { wbCloudPoll(true); render(); return true; }
   if (up == "WORD" || up == "WORDRESET" || up == "WORDDUE" || up.startsWith("WORDSET ") ||
       up == "PRON" || up.startsWith("PRON ")) { wordCmd(raw); return true; }
   if (up == "MIC" || up == "MICPIN" || up.startsWith("MICTEST")) { micCmd(raw); return true; }
@@ -3977,12 +4173,21 @@ static void handleTap(int x, int y) {
               gWifiSel = idx; gWifiSSID = String(gNetSSID[idx]);
               gWifiSecured = (gNetEnc[idx] != WIFI_AUTH_OPEN);
               gWifiSym = false; gWifiCaps = false; gWifiPass = "";
-              // 密码簿里有的网络：自动把密码填进去，用户只需点 JOIN（也可改了重输）
+              // 密码簿里有的网络：自动把密码填进去
               String bkPass;
               gWifiPassFromBook = gWifiSecured && wifiBookFind(gWifiSSID, bkPass);
               if (gWifiPassFromBook) gWifiPass = bkPass;
               Serial.printf("[WIFI] pick '%s' secured=%d fromBook=%d\n",
                             gWifiSSID.c_str(), (int)gWifiSecured, (int)gWifiPassFromBook);
+              // v3.1：点行主体就**直接连**，不再要求"再点一次 JOIN 确认"。
+              // 点行尾的「改」才进键盘改密码 —— 否则密码错了会陷入
+              // 「点了就连、连不上只能再点、永远改不了密码」的死循环。
+              const bool editPass = (x >= 286);
+              if (!editPass && (gWifiPassFromBook || !gWifiSecured)) {
+                if (!gWifiSecured) gWifiPass = "";
+                wifiConnect();
+                return;
+              }
               gWifiState = W_KEY; render(); return;
             }
           }
@@ -4039,12 +4244,38 @@ static void touchTask(void *) {
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
+    // v3.0：I²C 抖动时 CST816 会回一帧垃圾（pts 超 1、坐标越过 360）。
+    // 这种帧当成"没有触摸"直接丢弃 —— 否则会被当成真的抬手，在随机位置生成 TAP，
+    // 表现就是"网络忙的时候屏幕自己乱点/乱翻"。
+    if (pts > 1 || rx >= SCREEN_W || ry >= SCREEN_H) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
     uint32_t now = millis();
     if (pts > 0) {
-      if (!down) { down = true; sx = rx; sy = ry; tDown = now; }
+      if (!down) {
+        down = true; sx = rx; sy = ry; tDown = now;
+        // v3.1：落点在进度环带上且当前曲目可跳 -> 进入拖动模式。
+        // 拖环期间不再产生 TAP/SWIPE，否则松手会被当成"翻页"。
+        if (gRingArmed && ringHit(rx, ry)) {
+          const int pm = ringPermille(rx, ry);
+          if (pm >= 0) { gRingDragging = true; gRingDragPm = pm; }
+        }
+      }
+      if (gRingDragging) {
+        const int pm = ringPermille(rx, ry);
+        if (pm >= 0) gRingDragPm = pm;    // 滑过缺口时保持上一个值，别突然跳回 0
+      }
       lx = rx; ly = ry;
     } else if (down) {
       down = false;
+      if (gRingDragging) {
+        gRingDragging = false;
+        if (gRingDragPm >= 0) gRingSeekTo = gRingDragPm;   // 抬手才真正跳
+        gRingDragPm = -1;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
       int dx = lx - sx, dy = ly - sy;
       int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
       int m = adx > ady ? adx : ady;
@@ -4209,7 +4440,8 @@ void setup() {
                 ESP.getFlashChipSize() / 1048576, ESP.getPsramSize(), ESP.getFreeHeap());
   cfgLoad();                  // NVS 覆盖 config.h 默认值
   cloudLoadCreds();           // 百炼凭据（必须在这里读，全局构造时 NVS 还没 init）
-  petInit();                  // v1.0 电子宠物：从 NVS 读回状态
+  petInit();                  // WorkBuddy Buddy：从 NVS 读回状态
+  wbCloudInit();              // 云端推送源 URL/token（未配置则维持串口 DEMO）
   wordInit();                 // v1.0 背单词：读回词书与进度
   todoLoad();                 // v1.0 云端 AI：读回 Todo 清单
   // v0.16：天气/雷达城市（NVS city），默认上海；开机即生效，不用等网络
@@ -4281,6 +4513,9 @@ void setup() {
   if (gCfg.ssid.length() > 0) {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
+    // v3.1：配网页扫描时会临时关掉 STA 自动重连，如果那时直接断电，开关会留在关闭态。
+    // 开机这行无条件打开，保证断线能自己回来。
+    WiFi.setAutoReconnect(true);
     WiFi.begin(gCfg.ssid.c_str(), gCfg.pass.c_str());
     Serial.printf("[NET] connecting to '%s' ...\n", gCfg.ssid.c_str());
   } else {
@@ -4340,6 +4575,32 @@ void loop() {
     render();
   }
   cfgPoll();                  // 串口配置命令
+
+  // ── v3.1：外圈进度环拖动 ───────────────────────────────────────────
+  // 只要"音乐页 + 没开曲库浮层 + 有时长"就允许拖环 —— 播客虽然库里跳不了
+  // （setFilePos 只吃本地文件），但环上的拖动必须被**吞掉**，否则松手会变成
+  // 翻页手势，用户拖个进度条结果页面跳走了。
+  gRingArmed = (curPage == P_MUSIC && !gMusicList && audioDuration() > 1);
+  if (gRingSeekTo >= 0) {
+    const int pm = gRingSeekTo; gRingSeekTo = -1;
+    const uint32_t d = audioDuration();
+    if (d > 1) {
+      const uint32_t sec = (uint32_t)((uint64_t)d * pm / 1000);
+      if (audioCanSeek()) {
+        audioSeekSeconds(sec);
+        char tb[24];
+        snprintf(tb, sizeof(tb), "跳到 %02u:%02u", (unsigned)(sec / 60), (unsigned)(sec % 60));
+        showToast(tb);
+        Serial.printf("[UI] ring seek -> %d/1000 = %us/%us\n", pm, (unsigned)sec, (unsigned)d);
+      } else {
+        // 播客是网络 m4a 流：跳转要重新解析 MP4 索引，库做不到（见 AQ_SEEK 注释）
+        showToast("播客不支持跳转");
+        Serial.printf("[UI] ring seek rejected: src=%d not seekable\n", (int)audioSource());
+      }
+      render();
+    }
+  }
+
   // 离开配网页后把 STA 自动重连还回去（扫描时为避开干扰临时掐掉过）
   if (gWifiStoppedReconnect && curPage != P_WIFI) {
     gWifiStoppedReconnect = false;
@@ -4376,14 +4637,17 @@ void loop() {
 
   uint32_t interval = 250;                                   // 表盘 4 fps 足够
   if (curPage == P_WIFI) interval = 120;                    // 配网页：扫描/键盘响应
+  // 待办页有超宽条目在走马灯：250ms 一帧会变成 6px 一跳，压到 120ms 才连续
+  else if (curPage == P_TODO && gTodoScrolling) interval = 120;
   // 录音机：录音计时/回放进度要跟上（不录音不播放时也是 250ms 默认值，无需另设）
   else if (curPage == P_RECORDER && gAiState == AVS_RECORDING) interval = 200;
   // 音乐页降到 ~8fps：黑胶转动仍可见，但 QSPI 全屏 DMA 次数减半，
   // 与 Core0 上的 I2S 音频通道互不干扰（旧 16fps 是 DMA 竞态的诱因之一）。
-  else if (curPage == P_MUSIC) interval = 120;
+  else if (curPage == P_MUSIC) interval = gRingDragging ? 90 : 120;   // 拖进度环时提到 11fps 才跟手
   else if (curPage == P_RADAR) interval = 70;               // 扫描线 ~14 fps
   else if (curPage == P_POMO && pomo.running) interval = 200;
   else if (curPage == P_CHAT && xzChatActive()) interval = 180;  // 状态点/电平条要跟手
+  else if (curPage == P_PET) interval = gPetScroll ? 120 : 200;   // 桌面伙伴：5fps；走马灯时 8fps
   else if (gAiState == AVS_RECORDING) interval = 250;        // 录音：电平条 4fps
   if (now - lastDraw >= interval) { lastDraw = now; render(); }
   else delay(1);

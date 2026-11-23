@@ -19,7 +19,7 @@ flowchart LR
     CLOCK -->|"相对日期"| BA
     CLOCK -->|"时间显示"| UI
     TODO --> STORE["NVS"]
-    LOCAL["设置、背单词、电子宠物"] --> STORE
+    LOCAL["设置、背单词、WorkBuddy 伙伴"] --> STORE
     WIFI["主循环 Wi-Fi 连线管理"] --> CLOUD
     UI --> WIFI
 ```

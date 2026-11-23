@@ -126,6 +126,69 @@ static void wordBuildQueue(bool dueOnly) {
     int t = wordQueue[i]; wordQueue[i] = wordQueue[j]; wordQueue[j] = t;
   }
 }
+// ---------------- 进度持久化（v3.0）----------------
+// 旧版只在 NVS 存 SRS 阶段，wordPos / 本轮队列从不保存 → 每次开机从第 0 题重来。
+// 现在把「词库 + 随机种子 + 本轮队列 + 走到第几题」整包存 NVS，重启接着背。
+// 单库约 100 词，队列用 int16 足够；header 13B + n*2B，远小于 NVS 单键上限。
+// 进度缓冲放 PSRAM：2.4KB 若留在 .bss 会挤内部 RAM（v2.7 起内部堆已经很紧，
+// 曲库表就是这么把 LCD DMA 挤爆的）。分配到失败时退回静态小缓冲（正常不会走到）。
+#define WORD_PROG_MAX (13 + WORD_SRS_MAX * 2)
+static uint8_t *wordProgBuf = nullptr;
+static size_t   wordProgCap = 0;
+static uint8_t *wordProgMem() {
+  if (!wordProgBuf) {
+    wordProgBuf = (uint8_t *)ps_malloc(WORD_PROG_MAX);
+    if (wordProgBuf) {
+      wordProgCap = WORD_PROG_MAX;
+    } else {
+      static uint8_t fallback[13 + 64 * 2];    // 退化：单本 64 词以内仍可存
+      wordProgBuf = fallback;
+      wordProgCap = sizeof(fallback);
+    }
+  }
+  return wordProgBuf;
+}
+static void wordProgressSave() {
+  uint8_t *buf = wordProgMem();
+  if ((size_t)(13 + wordQueueN * 2) > wordProgCap) return;   // 缓冲不够宁可不存，不越界
+  int p = 0;
+  buf[p++] = (uint8_t)wordBook;
+  uint32_t rng = wordRng;
+  for (int i = 0; i < 4; i++) buf[p++] = (uint8_t)(rng >> (i * 8));
+  uint16_t vals[4] = {(uint16_t)wordPos, (uint16_t)wordQueueN,
+                      (uint16_t)wordRight, (uint16_t)wordWrong};
+  for (int v = 0; v < 4; v++) for (int i = 0; i < 2; i++) buf[p++] = (uint8_t)(vals[v] >> (i * 8));
+  for (int i = 0; i < wordQueueN; i++) {
+    uint16_t q = (uint16_t)wordQueue[i];
+    buf[p++] = (uint8_t)q; buf[p++] = (uint8_t)(q >> 8);
+  }
+  gPrefs.begin("rcfg", false);
+  gPrefs.putBytes("wd.prog", buf, (size_t)p);
+  gPrefs.end();
+}
+static bool wordProgressLoad() {
+  uint8_t *buf = wordProgMem();
+  gPrefs.begin("rcfg", true);
+  size_t len = gPrefs.getBytesLength("wd.prog");
+  if (len < 13 || len > wordProgCap) len = 0;
+  else gPrefs.getBytes("wd.prog", buf, len);
+  gPrefs.end();
+  if (!len) return false;
+  auto u16 = [&](int at) -> int { return buf[at] | (buf[at + 1] << 8); };
+  int book = buf[0];
+  uint32_t rng = 0;
+  for (int i = 0; i < 4; i++) rng |= (uint32_t)buf[1 + i] << (i * 8);
+  int pos = u16(5), n = u16(7), right = u16(9), wrong = u16(11);
+  if (book != wordBook || n <= 0 || n > wordTableN() || pos < 0 || pos > n) return false;
+  if (len != (size_t)(13 + n * 2)) return false;
+  wordPos = pos; wordQueueN = n; wordRight = right; wordWrong = wrong; wordRng = rng;
+  for (int i = 0; i < n; i++) wordQueue[i] = u16(13 + i * 2);
+  wordPicked = false; wordWasRight = false;
+  if (pos < n) wordNextQuestion();       // 重新生成当前题的四选一（答案不变）
+  Serial.printf("[WORD] resume book=%s %d/%d\n", WORD_BOOK_NAMES[wordBook], pos, n);
+  return true;
+}
+
 static void wordReset(bool keepStats) {
   wordPos = 0; wordPicked = false; wordWasRight = false;
   if (!keepStats) { wordRight = 0; wordWrong = 0; }
@@ -134,11 +197,12 @@ static void wordReset(bool keepStats) {
   if (wordQueueN == 0) wordBuildQueue(false);   // 今日已复习完 → 自由复习模式
   wordSave();
   if (wordQueueN) wordNextQuestion();
+  wordProgressSave();
 }
 static void wordInit() {
   wordLoad();
   wordSrsLoad();
-  wordReset(true);
+  if (!wordProgressLoad()) wordReset(true);     // 无存档才从第 0 题开始
 }
 
 // 出题：正确释义一个 + 三个来自同词库的干扰项，再打乱到四个槽位
@@ -360,6 +424,7 @@ static void wordTap(int x, int y) {
         if (wordWasRight) wordRight++; else wordWrong++;
         wordGrade(wordWasRight);
         wordSave();
+        wordProgressSave();
         render(); return;
       }
     }
@@ -369,8 +434,8 @@ static void wordTap(int x, int y) {
     if (!wordPicked) { wordWrong++; wordGrade(false); }
     wordPos++;
     wordSave();
-    if (wordPos < wordQueueN) { wordNextQuestion(); wordPronounce(); }
-    else { wordQueueN = wordPos; }
+    if (wordPos < wordQueueN) { wordNextQuestion(); wordPronounce(); wordProgressSave(); }
+    else { wordQueueN = wordPos; wordProgressSave(); }   // 完成态也存，重启不回退
     render();
   }
 }

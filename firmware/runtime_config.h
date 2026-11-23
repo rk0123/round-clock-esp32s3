@@ -111,6 +111,9 @@ static void cfgHandle(const String &raw) {
     Serial.println("          TAP <x> <y> (inject a tap) | SWIPE <x1> <y1> <x2> <y2> (inject a swipe)");
     Serial.println("          MIC (state) | MICTEST [1..20] (record N s: samples/peak/rms) | MICPIN (pin edge diag)");
     Serial.println("Cloud:    BAILIAN [key] | QWEN <text> | AI | AICANCEL | ASRTODO | XZBIND | XZSTATUS");
+    Serial.println("Buddy:    PET | PETDEMO | PETSTATE <0..6> | PETNEXT | PETAPPROVE | PETDENY");
+    Serial.println("          PETDIZZY | PETHEART | PETJSON <json>  (raw JSON line also accepted)");
+    Serial.println("          WBCLOUD <url> <token> | WBCLOUDOFF | WBCLOUDSTAT | WBCLOUDNOW (WiFi relay)");
     Serial.println("Gesture:  swipe LEFT/RIGHT on home -> app grid; swipe UP on any app -> home");
     Serial.println("          home shows ONLY the face picked in Settings (FACE card), not both");
     Serial.println("          pull DOWN from upper half -> settings on ANY page; push UP in settings -> back");
@@ -154,7 +157,7 @@ static void cfgPoll() {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
       if (gCmdBuf.length()) { cfgHandle(gCmdBuf); gCmdBuf = ""; }
-    } else if (gCmdBuf.length() < 220) {
+    } else if (gCmdBuf.length() < 1200) {   // WorkBuddy 心跳 JSON 可能带 entries/prompt，220 会截断
       gCmdBuf += c;
     }
   }

@@ -153,6 +153,7 @@ struct BatteryState {
   bool     charging = false;
   int      soc = 0, mv = 0, ma = 0, rm = 0, fcc = 0;
   uint16_t status = 0;
+  uint16_t opStatus = 0;   // v3.1.2：OperationStatus(0x3D)，bit0=CHG bit1=FC，BQ27xxx 标准位
   uint32_t lastMs = 0;
 };
 static BatteryState gBat;
@@ -160,6 +161,22 @@ static int gBatFail = 0;      // 连续读取失败次数（v3.0 去抖，3 次�
 // 验收注入：串口 BATF <soc> [chg] 可强制电量显示（-1 = 用真实读数），
 // 只为在没有真实低电/充电工况时验证颜色与格数，不写 NVS、不影响电量计本身。
 static int gBatFakeSoc = -1, gBatFakeChg = -1;
+// v3.1.2：充电判定 —— 按证据强弱排队，无证据就保持原状态
+//   强证据 Current(0x0C) 符号：插线充 +200mA、拔线 -269mA，3s 内立即切换
+//   弱证据 ① OperationStatus(0x3D) bit0 CHG（电流停在 0 即"已充满停充"时用）
+//          ② 24s 抬压 ≥4mV —— 正在灌电；**只用抬压，不用掉压**（充满后电压本就
+//            在缓慢回落，拿下跌当证据会让光点一帧有一帧无）
+//   已废弃 BatteryStatus(0x0A) 的 DSG 位：实测拔了 USB 仍恒 0，只保留在日志里
+static bool gChgState    = false;
+static int  gChgHyst     = 0;   // 弱证据连续计数（2 次 = 6s 才切换）
+static int  gMvRing[8]   = {0};
+static int  gMvIdx = 0, gMvCnt = 0, gMvDelta = 0;
+// v3.1.2 采样历史：每 3s 记一条，环形 40 条 ≈ 2 分钟。串口 CHGH 可回放，
+// 用来在「拔掉 USB（串口断）→ 插回来」之后回头看清那段时间 mv / ma 到底怎么变，
+// 不靠肉眼猜阈值。纯内存，不写 NVS，重启即清。
+struct ChgSample { uint16_t mv; int16_t ma; uint8_t soc; uint8_t chg; };
+static ChgSample gChgHist[40];
+static int gChgHistN = 0, gChgHistIdx = 0;
 
 static bool bqRead16(uint8_t reg, uint16_t &v) {
   // 触摸任务与主循环都会读 I²C（还有 RTC、ES8311），统一走 I2C_Lock 串行
@@ -190,6 +207,7 @@ static void batteryPoll(bool force = false) {
   gBatFail = 0;
   bqRead16(0x08, mv); bqRead16(0x0C, ma); bqRead16(0x0A, st);
   bqRead16(0x10, rm); bqRead16(0x12, fcc);
+  uint16_t op = 0; bqRead16(0x3D, op);   // OperationStatus：CHG / FC 位
   // 电压不在单节锂电范围就认为电池没插，绝不显示编造的百分比
   gBat.valid   = (mv >= 2500 && mv <= 4500);
   gBat.soc     = constrain((int)(soc & 0xFF), 0, 100);
@@ -197,7 +215,56 @@ static void batteryPoll(bool force = false) {
   gBat.ma      = (int)(int16_t)ma;
   gBat.rm      = (int)rm; gBat.fcc = (int)fcc;
   gBat.status  = st;
-  gBat.charging = gBat.valid && (gBat.ma > 20);
+  gBat.opStatus = op;
+  // v3.1.2：这颗 BQ27220 从没做过电池配置（fcc 报 3000mAh，实际 500mAh 电芯），
+  // 但 Current(0x0C) 本身**是好的**，实测拔线瞬间报 -269mA、充电时报 +200mA。
+  // v3.1.1 曾以为它"恒为 0"，其实那是**电池充满后充电 IC 停充**的工况 —— 而此时
+  // 用户恰恰就插着线，于是充电态永不触发，看着像"充电动画没了"。
+  // 更糟的是 v3.1.1 拿 BatteryStatus 的 DSG 位兜底，而这位**拔了 USB 仍恒 0**，
+  // 直接导致「拔了还显示充电」。现在按证据强弱排队，无证据就保持原状态。
+  const bool dsg = (st & 0x01) != 0;
+
+  // 环形缓冲：8 点 × 3s = 24s 窗口，取最老的点算电压变化
+  gMvDelta = 0;
+  if (gMvCnt >= 8) gMvDelta = gBat.mv - gMvRing[gMvIdx];
+  gMvRing[gMvIdx] = gBat.mv;
+  gMvIdx = (gMvIdx + 1) & 7;
+  if (gMvCnt < 8) gMvCnt++;
+
+  if (gBat.valid) {
+    bool prev = gChgState;
+    const bool opChg = (op & 0x01) != 0;    // OperationStatus bit0 CHG
+    // 强证据（电流符号）：立即切换。实测拔线 -269mA、充电 +200mA，3s 内就能认。
+    if (gBat.ma > 40) {
+      gChgState = true; gChgHyst = 0;
+    } else if (gBat.ma < -40) {
+      gChgState = false; gChgHyst = 0;
+    } else {
+      // 弱证据（电流停在 0，即充满停充）：要连续 2 次才认，防来回跳。
+      // 注意这里**没有**"电压下跌 -> 判未充电"这条 —— 电池充满后电压本就在缓慢
+      // 回落（实测 d24 常 -1~-2mV），拿它当证据会让光点一帧有一帧无。
+      bool want = gChgState;
+      if (gMvDelta >= 4 && gBat.soc < 100) want = true;   // 明显抬压 = 正在灌电
+      else if (gMvCnt >= 8 && opChg)       want = true;   // 电量计自报 CHG
+      if (want != gChgState) {
+        if (++gChgHyst >= 2) { gChgState = want; gChgHyst = 0; }
+      } else gChgHyst = 0;
+    }
+    if (prev != gChgState)
+      Serial.printf("[CHG] %s -> %s  ma=%d mv=%d d24=%+dmV soc=%d%% op=0x%04X\n",
+                    prev ? "CHARGING" : "IDLE", gChgState ? "CHARGING" : "IDLE",
+                    gBat.ma, gBat.mv, gMvDelta, gBat.soc, (unsigned)op);
+  }
+  gBat.charging = gBat.valid && gChgState;
+  (void)dsg;
+  if (gBat.valid) {
+    gChgHist[gChgHistIdx].mv  = (uint16_t)gBat.mv;
+    gChgHist[gChgHistIdx].ma  = (int16_t)gBat.ma;
+    gChgHist[gChgHistIdx].soc = (uint8_t)gBat.soc;
+    gChgHist[gChgHistIdx].chg = gBat.charging ? 1 : 0;
+    gChgHistIdx = (gChgHistIdx + 1) % 40;
+    if (gChgHistN < 40) gChgHistN++;
+  }
 }
 // 满电且插着 USB 时电流≈0，既不是充电也不是放电，别硬报 DISCHARGING
 static const char *batteryStateText() {
@@ -1342,30 +1409,43 @@ static void drawBatteryArc(int cx, int cy) {
   bool low = (!chg && soc <= 15);
   if (low && lit < 1) lit = 1;                 // 快没电时也留一格红，不要整条黑掉
 
-  uint16_t on  = chg ? COL(248, 206, 84)                      // 充电：琥珀黄
-                : (low ? COL(224, 76, 64)                      // 只剩最后一格：红
-                       : COL(96, 200, 128));                   // 平常：绿
+  uint16_t on  = low ? COL(224, 76, 64)                       // 只剩最后一格：红
+                     : COL(96, 200, 128);                     // 平常：绿
   uint16_t off = COL(46, 54, 64);              // 未点亮：暗板岩
+
+  // v3.1.1 充电流水灯（用户："模拟数字界面都需要"）—— 与数字表盘 4 格同一套节奏：
+  // 700ms 一格。已充格留暗琥珀底，当前格亮琥珀并向外加粗 1.6px，
+  // 光点沿"电量增长方向"（本弧是从右往左填）逐格跑动。
+  const uint16_t c_dim = COL(146, 110, 46);    // 已达电量：暗琥珀
+  const uint16_t c_hot = COL(255, 216, 124);   // 跑动光点：亮琥珀
+  int phase  = (int)((millis() / 700) % N);
+  int hotIdx = N - 1 - phase;                  // phase 0 → 最左格（i = N-1）
 
   // 逐像素判定「环形扇区」：格宽由角度精确控制，两端是直的径向切口。
   // 不能用 arcRing 一格一格描 —— 极坐标描边会在格子两端啃出锯齿、宽窄不一。
   const float rIn = R - TH / 2.0f - 0.3f, rOut = R + TH / 2.0f + 0.3f;
   const float in2 = rIn * rIn, out2 = rOut * rOut;
-  const int   bx0 = cx - (int)rOut - 1, bx1 = cx + (int)rOut + 1;
-  const int   by0 = cy + 18,            by1 = cy + (int)rOut + 1;
+  const float hotOut2 = (rOut + 1.6f) * (rOut + 1.6f);   // 光点格外沿（加粗）
+  const int   bx0 = cx - (int)rOut - 2, bx1 = cx + (int)rOut + 2;
+  const int   by0 = cy + 18,            by1 = cy + (int)rOut + 3;
   for (int y = by0; y <= by1; y++) {
     for (int x = bx0; x <= bx1; x++) {
       float dx = x - cx, dy = y - cy;
       float d2 = dx * dx + dy * dy;
-      if (d2 < in2 || d2 > out2) continue;
+      if (d2 < in2 || d2 > hotOut2) continue;   // 外沿先放到光点格的半径，下面再按格收紧
       // atan2 的 0° 在正东，arcRing/polar 的 0° 在正北 —— +90 对齐
       float pos = (atan2f(dy, dx) * 57.29578f + 90.0f - A0) / PITCH;
       if (pos < 0.0f || pos >= N) continue;
       int   i = (int)pos;
       float f = pos - i;
       if (f < GAPF || f > 1.0f - GAPF) continue;               // 格间缝
+      bool isHot = chg && (i == hotIdx);
+      if (!isHot && d2 > out2) continue;                       // 只有光点格允许外扩
       // pos 从右（141°）往左（219°）递增，翻转一下才是"从左往右填"的常规电量条
-      setPixel(x, y, (i >= N - lit) ? on : off);
+      uint16_t c;
+      if (chg) c = isHot ? c_hot : ((i >= N - lit) ? c_dim : off);
+      else     c = (i >= N - lit) ? on : off;
+      setPixel(x, y, c);
     }
   }
 }
@@ -3696,10 +3776,23 @@ bool cfgExtra(const String &raw) {
   if (up == "BAT") {
     batteryPoll(true);
     Serial.printf("[BAT] BQ27220 @0x55 valid=%d soc=%d%% mv=%d ma=%d charging=%d "
-                  "status=0x%04X rm=%dmAh fcc=%dmAh\n",
+                  "status=0x%04X dsg=%d op=0x%04X d24=%+dmV rm=%dmAh fcc=%dmAh\n",
                   (int)gBat.valid, gBat.soc, gBat.mv, gBat.ma, (int)gBat.charging,
-                  (unsigned)gBat.status, gBat.rm, gBat.fcc);
+                  (unsigned)gBat.status, (int)((gBat.status & 0x01) != 0),
+                  (unsigned)gBat.opStatus, gMvDelta, gBat.rm, gBat.fcc);
     if (!gBat.valid) Serial.println("[BAT] no ACK or battery voltage out of range -> UI shows NO BAT / USB");
+    return true;
+  }
+  // v3.1.2：回放电池采样历史（最旧 -> 最新，3s 一条）。用途：拔掉 USB 时串口跟着断，
+  // 插回来以后打 CHGH 就能看清拔掉那段时间 mv 到底有没有下滑、ma 有没有变负。
+  if (up == "CHGH") {
+    Serial.printf("[CHGH] %d samples (oldest first, 3s each)\n", gChgHistN);
+    for (int k = 0; k < gChgHistN; k++) {
+      int i = (gChgHistIdx - gChgHistN + k + 40 * 2) % 40;
+      Serial.printf("[CHGH] %02d mv=%u ma=%d soc=%u chg=%u\n",
+                    k + 1, (unsigned)gChgHist[i].mv, (int)gChgHist[i].ma,
+                    (unsigned)gChgHist[i].soc, (unsigned)gChgHist[i].chg);
+    }
     return true;
   }
   // v0.19：板载 PCF85063 状态 / 手动设时（没有网络也能把时间调准并写进 RTC）

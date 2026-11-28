@@ -1656,15 +1656,27 @@ static void renderMusicList() {
   clear(C_DARK2);
   int src = (int)audioSource();
   int n   = audioCount(src);
-  char ttl[40], disp[40];
-  snprintf(ttl, sizeof(ttl), "%s / %d TRACKS", AUD_SRC_NAME[src], n);
-  fitText(disp, sizeof(disp), ttl, 12, 150);
-  drawText(180, 40, disp, C_WHITE, 12, 1, 1);
+  char ttl[96], disp[96];
+  if (src == AS_POD) {
+    // v3.2：播客标题改成「当前节目名 + 集数」，「更新」出来的合辑标「全部来源」，
+    // 否则用户看不出曲库里这批到底是单档还是多档混在一起。
+    // ⚠️ FONT12 只有 ASCII，这些是中文，必须用 16 号（否则整行静默画不出来）。
+    snprintf(ttl, sizeof(ttl), "%s %d集", audioPodMerged() ? "全部来源" : audioPodFeedName(), n);
+    fitText(disp, sizeof(disp), ttl, 16, 210);
+    drawText(180, 34, disp, C_WHITE, 16, 1, 1);
+  } else {
+    snprintf(ttl, sizeof(ttl), "%s / %d TRACKS", AUD_SRC_NAME[src], n);
+    fitText(disp, sizeof(disp), ttl, 12, 150);
+    drawText(180, 40, disp, C_WHITE, 12, 1, 1);
+  }
 
   if (n == 0) {
-    const char *hint = src == AS_TF ? "NO SD CARD / TAP SCAN" :
-                       src == AS_POD ? "NO EPISODES / TAP FEED" : "NO STATION";
-    drawText(180, 160, hint, C_GREY, 12, 1, 1);
+    // 中文提示必须 16 号（FONT12 无汉字）
+    if (src == AS_POD) drawText(180, 156, "暂无节目 点更新", C_GREY, 16, 1, 1);
+    else {
+      const char *hint = src == AS_TF ? "NO SD CARD / TAP SCAN" : "NO STATION";
+      drawText(180, 160, hint, C_GREY, 12, 1, 1);
+    }
   }
   int pages = (n + MUSIC_LIST_ROWS - 1) / MUSIC_LIST_ROWS;
   if (pages < 1) pages = 1;
@@ -1702,6 +1714,7 @@ static void renderMusic() {
     arcRing(180, 180, 152, a0 + 60, a0 + 78, 12, COL(28, 35, 46));
   }
   int src = (int)audioSource();
+  const bool isPod = (src == AS_POD);     // v3.2：底部三键 / 抓取提示都靠它
   int n   = audioCount(src);
   uint32_t dur = audioDuration();
   float prog = dur ? (float)audioElapsed() / (float)dur : trackProgress;
@@ -1755,9 +1768,20 @@ static void renderMusic() {
                     (unsigned)(dur / 60), (unsigned)(dur % 60));
   else     snprintf(sub, sizeof(sub), "%s %s %d/%d", st, AUD_SRC_NAME[src], audioIndex() + 1, n);
   fitText(subFit, sizeof(subFit), sub, 12, 240);
-  // 副信息（状态 + 序号 + 时长）挪到播放键**下方**：上方已被三颗音源圆占满，
-  // 夹在曲名和播放键之间只剩 4px。底下 y=248..260 这段正好空着。
-  drawText(180, 250, subFit, COL(160, 176, 198), 12, 1, 1);
+  // v3.2：换源 / 更新全部来源都是同步抓取（逐个抓完最长几十秒，音频任务被占住），
+  // 不给提示的话屏幕看着就像卡死了。中文必须 16 号（FONT12 只有 ASCII）。
+  // 位置取 244 而不是原副信息的 250：16 号字高 16，底边 260，
+  // 与底部圆键顶边（292-25=267）才留得下 7px 空隙，不会被按钮压住。
+  const int job = audioPodJob();
+  if (job == 2) {
+    char jb[32];
+    snprintf(jb, sizeof(jb), "更新全部来源 %d/%d", audioPodStep(), POD_FEED_COUNT);
+    drawText(180, 244, jb, COL(255, 206, 84), 16, 1, 1);
+  } else if (job == 1) {
+    drawText(180, 244, "正在换源", COL(255, 206, 84), 16, 1, 1);
+  } else {
+    drawText(180, 250, subFit, COL(160, 176, 198), 12, 1, 1);
+  }
 
   // 中心唱片标签 + 超大播放键（视觉焦点）
   fillCircle(180, 180, 64, COL(20, 24, 31));
@@ -1781,16 +1805,25 @@ static void renderMusic() {
   fillTri(278, 168, 278, 192, 296, 180, C_WHITE);
   fillRect(294, 168, 4, 24, C_WHITE);
 
-  // 底部两键：曲库 / 源相关的维护动作（重扫卡 / 抓 feed / 切台）
-  // v0.27：82x30 圆角矩形 → **r=25 圆**，圆心落在 r=124 的弧上（左右各 30°）
-  fillCircle(118, 292, 25, COL(34, 43, 59));
-  circle(118, 292, 25, COL(58, 69, 96), 2);
-  drawBtnText(118, 284, 16, "曲库", C_WHITE, 16);
-  fillCircle(242, 292, 25, C_ORANGE_D);
-  circle(242, 292, 25, C_ORANGE, 2);
+  // 底部按键：曲库 / 源维护。
+  // v3.2：播客时**三键** —— 曲库 · 换源 · 更新；其他音源仍两键（曲库 + 重扫/切台）。
+  // 播客把左右两颗各外挪到 112/248，给中间的「换源」腾位置（三颗 r=25，
+  // 圆心间距 68 → 净间隙 18px，最远点 (248+25,292) 距圆心 145 < 158，不越安全区）。
+  const int bxL = isPod ? 112 : 118, bxR = isPod ? 248 : 242;
+  fillCircle(bxL, 292, 25, COL(34, 43, 59));
+  circle(bxL, 292, 25, COL(58, 69, 96), 2);
+  drawBtnText(bxL, 284, 16, "曲库", C_WHITE, 16);
+  if (isPod) {
+    // 换源 = 换一档节目（feed）。换集只走左右两颗大键，两者职责不重叠。
+    fillCircle(180, 292, 25, COL(34, 43, 59));
+    circle(180, 292, 25, COL(58, 69, 96), 2);
+    drawBtnText(180, 284, 16, "换源", C_WHITE, 16);
+  }
+  fillCircle(bxR, 292, 25, C_ORANGE_D);
+  circle(bxR, 292, 25, C_ORANGE, 2);
   // ⚠️ 必须显式传 16：drawBtnText 默认 font=12，而 FONT12 只有 ASCII，
   // 中文会静默画不出来（按钮变成空块）。
-  drawBtnText(242, 284, 16, src == AS_TF ? "重扫" : src == AS_POD ? "更新" : "切台", C_WHITE, 16);
+  drawBtnText(bxR, 284, 16, src == AS_TF ? "重扫" : isPod ? "更新" : "切台", C_WHITE, 16);
 }
 
 // ================================================================ 页 4 航班雷达
@@ -3747,6 +3780,11 @@ bool cfgExtra(const String &raw) {
     }
     return true;
   }
+  if (up == "PODUPDATE") {
+    audioPodUpdateAll();
+    Serial.printf("[CFG] podcast update-all queued (%d feeds -> merged list)\n", POD_FEED_COUNT);
+    return true;
+  }
   if (up.startsWith("PODADD ")) {
     String rest = raw.substring(7); rest.trim();
     int sp = rest.indexOf(' ');
@@ -3992,6 +4030,10 @@ bool cfgExtra(const String &raw) {
                   (unsigned)audioElapsed(), (unsigned)audioDuration());
     Serial.printf("  Library   : radio=%d tf=%d pod=%d vol=%d/21\n",
                   STREAM_COUNT, audioCount(AS_TF), audioCount(AS_POD), gVolume);
+    if (audioCount(AS_POD) > 0 || audioPodJob())
+      Serial.printf("  PodFeed   : %s  merged=%s  job=%d\n",
+                    audioPodMerged() ? "ALL SOURCES" : audioPodFeedName(),
+                    audioPodMerged() ? "YES" : "NO", audioPodJob());
     if (gBat.valid) {
       Serial.printf("  Battery   : %d%%  %dmV  %dmA  %s (BQ27220)\n",
                     gBat.soc, gBat.mv, gBat.ma, batteryStateText());
@@ -4080,17 +4122,25 @@ static void handleTap(int x, int y) {
         audioNext(1);  trackProgress = 0;
       } else if (y >= 86 && y <= 112 && x >= 60 && x <= 300) {  // 点曲名开曲库
         gMusicList = true; gMusicPage = 0; render(); return;
-      } else if (hit(x, y, 118, 292, 32)) {     // 曲库（图形 r25，热区 r32）
-        gMusicList = true; gMusicPage = 0; render(); return;
-      } else if (hit(x, y, 242, 292, 32)) {     // 重扫 / 更新 / 切台
-        int s = (int)audioSource();
-        if      (s == AS_TF)  { audioRescanTF();        showToast("TF RESCAN..."); }
-        else if (s == AS_POD) {
-          audioPodFeedNext();          // 循环切换下一条小宇宙中文播客（失败自动换源）
-          showToast("NEXT PODCAST FEED");
+      } else {
+        // v3.2：播客时底部是三键（曲库 112 · 换源 180 · 更新 248），
+        // 其他音源仍是两键（曲库 118 / 重扫·切台 242）。热区 r32，
+        // 圆心间距 68 > 32+32=64，三颗互不抢触摸。
+        const int s   = (int)audioSource();
+        const int bxL = (s == AS_POD) ? 112 : 118;
+        const int bxR = (s == AS_POD) ? 248 : 242;
+        if (hit(x, y, bxL, 292, 32)) {          // 曲库（图形 r25，热区 r32）
+          gMusicList = true; gMusicPage = 0; render(); return;
+        } else if (s == AS_POD && hit(x, y, 180, 292, 32)) {   // 换源（只有播客有）
+          audioPodFeedNext();          // 切下一档节目；失败会自动往下试，不会卡死
+          showToast("换下一个播客源");
+          render(); return;
+        } else if (hit(x, y, bxR, 292, 32)) {   // 重扫 / 更新 / 切台
+          if      (s == AS_TF)  { audioRescanTF();      showToast("扫描 TF 卡"); }
+          else if (s == AS_POD) { audioPodUpdateAll();  showToast("更新全部来源"); }
+          else                  { audioNext(1); trackProgress = 0; }
+          render(); return;
         }
-        else                  { audioNext(1); trackProgress = 0; }
-        render(); return;
       }
       break;
     case P_RADAR:

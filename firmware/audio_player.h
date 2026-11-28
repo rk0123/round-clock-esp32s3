@@ -101,18 +101,26 @@ static const char *const AUD_SRC_NAME[] = {"RADIO", "MUSIC", "PODCAST"};
 //      bestblogs.dev 公共实例实测 200/8s，enclosure 已是 media.xyzcdn.net/*.m4a 直链。
 // 前 130KB 即可拿满每档 15~34 集，m4a 由 ESP32-audioI2S 3.4.0 CODEC_M4A 流式解码。
 // 李诞官方 feed 的 enclosure 带 dts-api.xiaoyuzhoufm.com 跟踪前缀，由 podNormalizeUrl() 剥成直链。
-struct PodFeed { const char *name; const char *url; };
+// v3.2：加 tag（2 字简称）。「更新」会把所有节目源合并成一张表，
+// 那时标题前必须挂一个小标记，否则二十几条混在一起分不清出自哪档。
+// tag 必须是 2 个汉字（或 2 个 ASCII），长度只影响列表可读性。
+struct PodFeed { const char *name; const char *tag; const char *url; };
 static const PodFeed POD_FEEDS[] = {
-  // 用户点名的四档排最前，FEED 按钮能最快轮到
-  {"无聊斋",             "https://rsshub.bestblogs.dev/xiaoyuzhou/podcast/5e280fac418a84a0461fb129"},
-  {"谐星聊天会",         "https://rsshub.bestblogs.dev/xiaoyuzhou/podcast/5e280fa7418a84a0461f912b"},
-  {"李诞",               "https://feed.xyzfm.space/l3c8em3l8hfn"},
-  {"忽左忽右",           "https://rsshub.bestblogs.dev/xiaoyuzhou/podcast/5e4ee557418a84a0466737b7"},
-  // 原有两档保留
-  {"半拿铁 / 商业沉浮录", "https://rsshub.bestblogs.dev/xiaoyuzhou/podcast/62382c1103bea1ebfffa1c00"},
-  {"半拿铁周刊",         "https://feed.xyzfm.space/vylham8uw3ay"},
+  // 用户点名的四档排最前，换源键能最快轮到
+  {"无聊斋",             "无聊", "https://rsshub.bestblogs.dev/xiaoyuzhou/podcast/5e280fac418a84a0461fb129"},
+  {"谐星聊天会",         "谐星", "https://rsshub.bestblogs.dev/xiaoyuzhou/podcast/5e280fa7418a84a0461f912b"},
+  // v3.2：小宇宙官方托管 feed.xyzfm.space 已改成 IP 白名单，本机 / 设备一律 403。
+  // 李诞换用 RSSHub 的同节目路由（2026-11-28 实测 200 / 15 集），节目不变只是换镜像。
+  {"李诞",               "李诞", "https://rsshub.bestblogs.dev/xiaoyuzhou/podcast/65bb55f6513a776b57dedb32"},
+  {"忽左忽右",           "忽左", "https://rsshub.bestblogs.dev/xiaoyuzhou/podcast/5e4ee557418a84a0466737b7"},
+  {"半拿铁 / 商业沉浮录", "沉浮", "https://rsshub.bestblogs.dev/xiaoyuzhou/podcast/62382c1103bea1ebfffa1c00"},
+  // 「半拿铁·周刊」原来指向 feed.xyzfm.space/vylham8uw3ay，同样被 IP 白名单挡掉，
+  // 又找不到可用镜像 —— 先摘掉。留着只会让「更新」每次白等十几秒超时。
+  // 要恢复：找到它能用的 RSS，加回这里即可（条数自动统计，不用改别处）。
 };
-#define POD_FEED_COUNT 6
+// v3.2：条数改成自动统计。旧代码是 #define POD_FEED_COUNT 6 手写常量，
+// 加/删一档忘了同步这个数就会越界读到别的内存。
+#define POD_FEED_COUNT ((int)(sizeof(POD_FEEDS) / sizeof(POD_FEEDS[0])))
 static int gPodFeedIdx = 0;
 #define AUD_DEFAULT_FEED (POD_FEEDS[0].url)
 
@@ -135,9 +143,17 @@ static volatile int  gTfN = 0;
 static bool          gTfMounted = false;
 static AudTrack *gPod = nullptr;
 static volatile int  gPodN = 0;
+// v3.2：true = 当前列表是「更新」把所有来源合并出来的合辑（不是单一 feed）。
+// 只影响曲库页标题显示，以及串口 dump。
+static volatile bool gPodMerged = false;
 static volatile AudSrc gSrc = AS_RADIO;
 static volatile int    gIdx = 0;
 static volatile bool   gPodBusy = false;
+// v3.2：区分两种耗时任务，好让界面说清楚在等什么
+//   0 = 空闲，1 = 换源（抓一档），2 = 更新全部来源（逐个抓完，几十秒）
+static volatile uint8_t gPodJob = 0;
+// 「更新全部来源」当前抓到第几档（1..N），给界面做进度提示
+static volatile uint8_t gPodStep = 0;
 
 // ------------------------------------------------------------------ 运行时状态
 static Audio           *gAudio      = nullptr;
@@ -178,6 +194,7 @@ static std::atomic<bool> gExtPcmOn{false};
 enum : uint8_t {
   AQ_NONE = 0, AQ_PLAY, AQ_TOGGLE, AQ_NEXT, AQ_STOP, AQ_TONE, AQ_VOL,
   AQ_SOURCE, AQ_SELECT, AQ_RESCAN_TF, AQ_PODFEED, AQ_PODADD, AQ_PODCLEAR, AQ_TFTEST,
+  AQ_PODUPDATE,     // v3.2：把所有播客来源的最新节目合并成一张表
   AQ_PLAYFILE,           // 播一条指定路径的本地音频（录音回放用，text = 完整路径）
   AQ_PLAYURL,            // 播一条网络音频（背单词发音：有道 dictvoice，text = 完整 URL）
   AQ_SEEK                // 按秒跳转（arg = 目标秒数；仅本地文件有效）
@@ -454,14 +471,30 @@ static bool tfMakeTestWav(const char *path = "/music/test-tone.wav") {
 }
 
 // ------------------------------------------------------------------ 播客清单（NVS）
+// v3.2：合辑最多 20 条 × ~250B ≈ 5KB，NVS 单条 blob 未必吃得下（rcfg 里还有
+// WiFi / 设置 / 词书进度）。写失败就砍半重试，宁可少存几条也不能整个丢干净 ——
+// 老版本 putString 不检查返回值，库里 30 条时会静默变成 0 条。
 static void podSave() {
-  String blob;
-  for (int i = 0; i < gPodN; i++) { blob += gPod[i].name; blob += '|'; blob += gPod[i].url; blob += '\n'; }
-  Preferences p; p.begin("rcfg", false); p.putString("podlist", blob); p.end();
+  static const int kLimits[] = {AUD_MAX_TRACKS, 16, 8};
+  Preferences p; p.begin("rcfg", false);
+  p.putBool("podmg", gPodMerged);      // 合辑标志要一起存，否则重启后标题显示成单档名
+  for (int k = 0; k < 3; k++) {
+    String blob;
+    int cnt = min((int)gPodN, kLimits[k]);
+    for (int i = 0; i < cnt; i++) { blob += gPod[i].name; blob += '|'; blob += gPod[i].url; blob += '\n'; }
+    if (p.putString("podlist", blob) > 0) {
+      if (cnt < (int)gPodN) Serial.printf("[POD] save truncated %d -> %d (NVS full)\n", (int)gPodN, cnt);
+      p.end();
+      return;
+    }
+  }
+  p.end();
+  Serial.println("[POD] save failed: NVS full, list lives in RAM only");
 }
 static void podLoad() {
   Preferences p; p.begin("rcfg", true);
   String blob = p.getString("podlist", "");
+  gPodMerged = p.getBool("podmg", false);
   p.end();
   gPodN = 0;
   int pos = 0;
@@ -496,11 +529,13 @@ static void podAdd(const char *name, const char *url) {
 }
 
 // 轻量 RSS 解析：只取前 128 KB（最新剧集在文件开头），不引 XML 库、不解析全文。
-// 抽 <item> 里的 <title> 与 <enclosure url="...">，最多 8 条。
-static int podParseXml(const char *xml) {
+// 抽 <item> 里的 <title> 与 <enclosure url="...">，最多 cap 条写入 dst。
+// v3.2：从「直接写 gPod」改成「写调用方给的数组」—— 「更新」要先把每档解析到
+// 临时区再合并去重，不能直接覆盖 gPod（会把上一档的结果冲掉）。
+static int podParseXmlTo(const char *xml, AudTrack *dst, int cap) {
   const char *p = xml;
   int n = 0;
-  while ((p = strstr(p, "<item")) != nullptr && n < 8) {
+  while ((p = strstr(p, "<item")) != nullptr && n < cap) {
     const char *end = strstr(p, "</item>");
     if (!end) break;
     char title[AUD_NAME_LEN] = {0};
@@ -543,31 +578,35 @@ static int podParseXml(const char *xml) {
     }
     if (url[0]) {
       if (!title[0]) snprintf(title, sizeof(title), "EP%02d", n + 1);
-      strncpy(gPod[n].name, title, sizeof(gPod[n].name) - 1);
-      strncpy(gPod[n].url, url, sizeof(gPod[n].url) - 1);
+      strncpy(dst[n].name, title, sizeof(dst[n].name) - 1);
+      dst[n].name[sizeof(dst[n].name) - 1] = 0;      // 显式收尾，避免残留上一条的尾巴
+      strncpy(dst[n].url, url, sizeof(dst[n].url) - 1);
+      dst[n].url[sizeof(dst[n].url) - 1] = 0;
       n++;
     }
     p = end + 7;
   }
   return n;
 }
-static bool podFetchFeed(const char *feedUrl) {
-  if (!wifiOK) { Serial.println("[POD] no WiFi"); return false; }
+// 拉一档 feed 并解析到 dst（最多 cap 条），返回条数；<=0 表示失败。
+// v3.2：从「直接覆盖 gPod」拆出来，「更新」需要对每档分别拉到临时区再合并。
+static int podFetchFeedInto(const char *feedUrl, AudTrack *dst, int cap) {
+  if (!wifiOK) { Serial.println("[POD] no WiFi"); return 0; }
   WiFiClientSecure cli;
   cli.setInsecure();
   cli.setTimeout(15000);
   HTTPClient http;
   http.setTimeout(15000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  if (!http.begin(cli, feedUrl)) { Serial.println("[POD] http.begin failed"); return false; }
+  if (!http.begin(cli, feedUrl)) { Serial.println("[POD] http.begin failed"); return 0; }
   int code = http.GET();
   if (code != 200 && code != 206) {
     Serial.printf("[POD] feed HTTP %d\n", code);
     http.end();
-    return false;
+    return 0;
   }
   char *xml = (char *)ps_malloc(131072);
-  if (!xml) { http.end(); Serial.println("[POD] PSRAM alloc failed"); return false; }
+  if (!xml) { http.end(); Serial.println("[POD] PSRAM alloc failed"); return 0; }
   uint32_t len = 0;
   int items = 0;
   WiFiClient *st = http.getStreamPtr();
@@ -596,12 +635,90 @@ static bool podFetchFeed(const char *feedUrl) {
   }
   http.end();
   Serial.printf("[POD] feed read %u bytes in %u ms\n", (unsigned)len, (unsigned)(millis() - t0));
-  if (len < 200) { free(xml); Serial.println("[POD] feed too short"); return false; }
-  gPodN = podParseXml(xml);
+  if (len < 200) { free(xml); Serial.println("[POD] feed too short"); return 0; }
+  int got = podParseXmlTo(xml, dst, cap);
   free(xml);
+  Serial.printf("[POD] feed parsed: %u bytes -> %d episodes\n", (unsigned)len, got);
+  return got;
+}
+// 覆盖当前列表（换源 / 刷新当前源）
+static bool podFetchFeed(const char *feedUrl) {
+  int n = podFetchFeedInto(feedUrl, gPod, 8);
+  if (n <= 0) return false;
+  gPodN = n;
+  gPodMerged = false;
   podSave();
-  Serial.printf("[POD] feed parsed: %d bytes -> %d episodes\n", (unsigned)len, (int)gPodN);
-  return gPodN > 0;
+  return true;
+}
+
+// ------------------------------------------------------------------ 全部来源更新
+static void audStop();      // 定义在下面，这里先用（「更新」清掉已下架的当前集要停播）
+// 「更新」= 把 POD_FEED_COUNT 档节目各自最新的几集合并成一张表（按 URL 去重）。
+// 每档只取 4 集：5 × 4 = 20 条，既能看出「这档最近出了什么」，又把 PSRAM/NVS 体积压住
+// （20 条 × ~250B ≈ 5KB，NVS 勉强吃得下；podSave 还会在写失败时自动截半）。
+#define POD_REFRESH_PER_FEED 4
+static int podRefreshAll() {
+  if (!wifiOK) { Serial.println("[POD] refresh: no WiFi"); return -1; }
+  const int cap = POD_FEED_COUNT * POD_REFRESH_PER_FEED;
+  AudTrack *tmp = (AudTrack *)ps_malloc(sizeof(AudTrack) * 8);
+  AudTrack *out = (AudTrack *)ps_malloc(sizeof(AudTrack) * cap);
+  if (!tmp || !out) { free(tmp); free(out); Serial.println("[POD] refresh: OOM"); return -1; }
+
+  // 记下正在播的那一集，更新完尽量让它保持不动
+  String curUrl, curName;
+  if (gPodN > 0 && gIdx >= 0 && gIdx < gPodN) { curUrl = gPod[gIdx].url; curName = gPod[gIdx].name; }
+
+  int outN = 0, okFeeds = 0;
+  for (int f = 0; f < POD_FEED_COUNT && outN < cap; f++) {
+    gPodStep = (uint8_t)(f + 1);        // 界面据此显示「更新 2/5」
+    int got = podFetchFeedInto(POD_FEEDS[f].url, tmp, POD_REFRESH_PER_FEED);
+    if (got <= 0) {
+      Serial.printf("[POD] refresh %d/%d '%s' FAILED\n", f + 1, POD_FEED_COUNT, POD_FEEDS[f].name);
+      continue;
+    }
+    okFeeds++;
+    for (int k = 0; k < got && outN < cap; k++) {
+      bool dup = false;
+      for (int j = 0; j < outN; j++) if (strcmp(out[j].url, tmp[k].url) == 0) { dup = true; break; }
+      if (dup) continue;
+      // 标题挂 2 字节目简称，合辑里才分得清哪条出自哪档
+      char joined[AUD_NAME_LEN * 2];
+      snprintf(joined, sizeof(joined), "%s %s", POD_FEEDS[f].tag, tmp[k].name);
+      audUtf8Name(out[outN].name, sizeof(out[outN].name), joined);
+      strncpy(out[outN].url, tmp[k].url, sizeof(out[outN].url) - 1);
+      out[outN].url[sizeof(out[outN].url) - 1] = 0;
+      outN++;
+    }
+    Serial.printf("[POD] refresh %d/%d '%s' +%d\n", f + 1, POD_FEED_COUNT, POD_FEEDS[f].name, got);
+  }
+  free(tmp);
+  gPodStep = 0;
+  if (outN == 0) { free(out); Serial.println("[POD] refresh: all feeds failed"); return -1; }
+
+  // 当前播放集在新表里的位置（找不到就说明它已被新节目顶掉）
+  int keep = -1;
+  if (curUrl.length())
+    for (int i = 0; i < outN; i++) if (curUrl == out[i].url) { keep = i; break; }
+
+  // gPod 是固定容量数组，原地覆盖前 outN 条，不换指针
+  memcpy(gPod, out, sizeof(AudTrack) * outN);
+  free(out);
+  gPodN = outN;
+  gPodMerged = true;
+  podSave();
+  if (keep >= 0) {
+    gIdx = keep;
+  } else {
+    if (gAudioState == A_PLAYING || gAudioState == A_CONNECTING) {
+      // 正在播的那集已经不在最新列表里 —— 停下来，别让界面指着别的节目却说在播
+      Serial.println("[POD] refresh: current episode dropped -> stop");
+      audStop();
+    }
+    gIdx = 0;
+  }
+  Serial.printf("[POD] refresh done: %d/%d feeds ok, %d episodes, keep=%d\n",
+                okFeeds, POD_FEED_COUNT, outN, keep);
+  return outN;
 }
 
 // 第三方 RSSHub 实例随时可能失效，三条中文播客依次试，任一成功就停。
@@ -888,20 +1005,29 @@ static void audExec(const AudCmd &c) {
       break;
     case AQ_PODFEED:
       if (gAudioReady) { gAudio->stopSong(); gAudioState = A_IDLE; }
-      gPodBusy = true;
+      gPodBusy = true; gPodJob = 1;
       if (c.text[0])          podFetchFeed(c.text);              // PODFEED <自定义 RSS URL>
       else if (c.arg > 0)      podFetchAny(c.arg - 1);            // FEED 按钮：切下一条中文播客
       else                     podFetchAny(gPodFeedIdx);          // 刷新当前 feed（失败自动换源）
       gIdx = 0;
-      gPodBusy = false;
+      gPodBusy = false; gPodJob = 0;
       break;
     case AQ_PODADD:
       podAdd(c.name, c.text);
       break;
     case AQ_PODCLEAR:
-      gPodN = 0; podSave(); gIdx = 0;
+      gPodN = 0; podSave(); gIdx = 0; gPodMerged = false;
       Serial.println("[POD] list cleared");
       break;
+    case AQ_PODUPDATE: {
+      // 「更新」：遍历全部来源，合并成一张表。**不先 stopSong** —— 用户就是边听边更，
+      // 只要当前这集还在新表里就让它接着播（podRefreshAll 里按 URL 找回位置）。
+      gPodBusy = true; gPodJob = 2;
+      const int n = podRefreshAll();
+      gPodBusy = false; gPodJob = 0;
+      Serial.printf("[POD] update all -> %d episodes (%s)\n", n, n > 0 ? "ok" : "failed");
+      break;
+    }
     // ---- 录音回放：播一条指定路径的本地文件 ----
     // 与 audStart(AS_TF) 的区别：路径不在 gTf[] 里（录音目录不进曲库），且**播完就停**
     // （gToneMode=true 走"本地文件"分支），不会自动续播下一首、也不会当电台重连。
@@ -1028,6 +1154,11 @@ static void audioPodFeedNext()            { audSend(AQ_PODFEED, (gPodFeedIdx + 1
 static void audioPodFeedSelect(int idx)   { audSend(AQ_PODFEED, constrain(idx, 0, POD_FEED_COUNT - 1) + 1); }
 static int  audioPodFeedIndex()           { return gPodFeedIdx; }
 static const char *audioPodFeedName()     { return POD_FEEDS[gPodFeedIdx].name; }
+static bool audioPodMerged()              { return gPodMerged; }
+static int  audioPodJob()                 { return (int)gPodJob; }   // 0 空闲 / 1 换源 / 2 更新全部
+static int  audioPodStep()                { return (int)gPodStep; }  // 更新进度 1..N
+// v3.2「更新」：所有来源的新节目合成一张表（不换源、不停播）
+static void audioPodUpdateAll()           { audSend(AQ_PODUPDATE); }
 static void audioPodAdd(const char *name, const char *url) { audSend(AQ_PODADD, 0, 0, url, name); }
 static void audioPodClear()               { audSend(AQ_PODCLEAR); }
 // v2.8：背单词发音。播完即停（gToneMode），不进曲库、不自动续播下一条。
@@ -1095,6 +1226,9 @@ static void audioStatusDump() {
                 gRadioN, (int)gTfN, (int)gPodN, (int)gAudioVol,
                 (unsigned)(gAudioReady ? gAudio->getVolume() : 0),
                 gMuteApplied ? "YES" : "NO");
+  Serial.printf("  PODLIST   : feed=%d/%d '%s' merged=%s\n",
+                gPodFeedIdx + 1, POD_FEED_COUNT, POD_FEEDS[gPodFeedIdx].name,
+                gPodMerged ? "YES" : "NO");
   for (int i = 0; i < gPodN; i++)
     Serial.printf("  POD %2d %-28s %s\n", i + 1, gPod[i].name, gPod[i].url);
 }
